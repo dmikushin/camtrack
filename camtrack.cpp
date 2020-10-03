@@ -4,6 +4,7 @@
 // NOT USED: v4l2loopback-ctl set-caps video/x-raw,format=UYVY,width=640,height=480 /dev/video0
 
 #include <cassert>
+#include <chrono>
 #include <cmath>
 #include <iostream>
 
@@ -25,7 +26,7 @@ using std::endl;
 
 typedef float prec;
 constexpr int kOutWidth = 640;
-constexpr int kOutHeight = 360;
+constexpr int kOutHeight = 480;
 constexpr prec kOutAspect = (prec)kOutWidth / kOutHeight;
 // I put a lot of primes in here to try to keep the zoom algorithms
 // from converging on small binary fractions; I figured that would
@@ -142,9 +143,9 @@ template<typename T=prec>
 class SmoothMovingRect {
  public:
   template<typename Q>
-  SmoothMovingRect(cv::Rect_<Q> bounds) 
+  SmoothMovingRect(cv::Rect_<Q> bounds, T aspect)
       : bounds_(bounds),
-        aspect_(static_cast<T>(bounds.width) / bounds.height),
+        aspect_(aspect),
         centerX_(bounds.x + static_cast<T>(bounds.width) / 2),
         centerY_(bounds.y + static_cast<T>(bounds.height) / 2),
         size_(bounds.width * bounds.height) {};
@@ -179,8 +180,59 @@ SmoothMovingRect<T>::scale(T factor, T verticalPositioning) const {
   T width = aspect * height;
   T x = static_cast<T>(centerX_) - (width / 2);
   T y = static_cast<T>(centerY_) - (height * verticalPositioning);
-  // XXX Respect the bounds (we currently let the affine transform do
-  // border stuff)
+
+#if 0
+  cout << width << "x"
+       << height << "+"
+       << x << "+"
+       << y << " / "
+       << bounds_.width << "x"
+       << bounds_.height << "+"
+       << bounds_.x << "+"
+       << bounds_.y;
+#endif
+  
+  // Shrink it into bounds, while maintaining the aspect ratio.  We
+  // always shrink from all edges, to maintain the center.
+  if (x < 0) {
+    T delta = -x;
+    width -= 2 * delta;
+    height -= 2 * delta / aspect;
+    x = 0;
+  }
+  if (y < 0) {
+    T delta = -y;
+    height -= 2 * delta;
+    width -= 2 * delta * aspect;
+    y = 0;
+  }
+  T right = x + width;
+  T bounds_right = bounds_.x + bounds_.width;
+  if (right > bounds_right) {
+    T delta = right - bounds_right;
+    width -= 2 * delta;
+    height -= 2 * delta / aspect;
+    x += delta;
+    y += delta / aspect;
+  }
+  T bottom = y + height;
+  T bounds_bottom = bounds_.y + bounds_.height;
+  if (bottom > bounds_bottom) {
+    T delta = bottom - bounds_bottom;
+    height -= 2 * delta;
+    width -= 2 * delta * aspect;
+    y += delta;
+    x += delta * aspect;
+  }
+
+#if 0
+  cout << " -> "
+       << width << "x"
+       << height << "+"
+       << x << "+"
+       << y << endl;
+#endif
+  
   return cv::Rect_<Q>(x, y, width, height);
 }
 
@@ -189,9 +241,11 @@ SmoothMovingRect<T>::operator<<(const cv::Rect_<T>& target) {
   centerX_ << target.x + target.width / 2;
   centerY_ << target.y + target.height / 2;
   size_ << target.width * target.height;
+#if 0
   cout << static_cast<T>(centerX_) << ","
        << static_cast<T>(centerY_) << " @ "
        << static_cast<T>(size_) << endl;
+#endif
 }
 
 template<typename T> cv::Rect_<T>
@@ -232,8 +286,8 @@ main()
   if (!cam.isOpened())
     errx(1, "open camera 1");
   cam.set(cv::CAP_PROP_FOURCC, cv::VideoWriter::fourcc('M', 'J', 'P', 'G'));
-  //cam.set(cv::CAP_PROP_FRAME_WIDTH, 1920);
-  //cam.set(cv::CAP_PROP_FRAME_HEIGHT, 1080);
+  cam.set(cv::CAP_PROP_FRAME_WIDTH, 1920);
+  cam.set(cv::CAP_PROP_FRAME_HEIGHT, 1080);
 #define DUMP_PROP(x)                            \
   do {                                          \
       auto propVal = cam.get(cv:: x);           \
@@ -246,7 +300,7 @@ main()
   DUMP_PROP(CAP_PROP_FRAME_WIDTH);
   DUMP_PROP(CAP_PROP_FRAME_HEIGHT);
   DUMP_PROP(CAP_PROP_FPS);
-  DUMP_PROP(CAP_PROP_FOURCC);
+  //DUMP_PROP(CAP_PROP_FOURCC);
   DUMP_PROP(CAP_PROP_FRAME_COUNT);
   DUMP_PROP(CAP_PROP_FORMAT);
   DUMP_PROP(CAP_PROP_MODE);
@@ -313,7 +367,10 @@ main()
   cv::Mat output;
   std::vector<cv::Rect> faces;
 
-  SmoothMovingRect<prec> roi(cv::Rect(0, 0, camWidth, camHeight));
+  SmoothMovingRect<prec> roi(cv::Rect(0, 0, camWidth, camHeight), kOutAspect);
+
+  int interval_frames = 0;
+  auto interval_start = std::chrono::steady_clock::now();
   
   for (;;) {
     cam >> frame;
@@ -345,7 +402,7 @@ main()
       auto xfrm = cv::getAffineTransform(src, dst);
       cv::warpAffine(frame, output, xfrm,
                      cv::Size{kOutWidth, kOutHeight},
-                     cv::INTER_CUBIC);
+                     cv::INTER_LINEAR);
     } catch (cv::Exception &e) {
       // Debugging aid
       cerr << "Output " << xmit << endl;
@@ -360,5 +417,19 @@ main()
       err(1, "write frame");
     
     cv::waitKey(1);
+
+    interval_frames++;
+    auto now = std::chrono::steady_clock::now();
+    std::chrono::duration<double> interval_duration = now - interval_start;
+    if (interval_duration.count() >= 1) {
+      int fps = interval_frames / interval_duration.count();
+      cout << "FPS: " << fps << endl;
+      interval_frames = 0;
+      interval_start = now;
+    }
   }
 }
+
+// Local Variables:
+// compile-command: "g++ -Werror -Wall -Wextra -O2 -g -I/usr/include/opencv4 camtrack.cpp -lopencv_videoio -lopencv_highgui -lopencv_imgproc -l opencv_objdetect -lopencv_core -o camtrack"
+// End:
