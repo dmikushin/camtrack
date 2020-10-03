@@ -1,5 +1,7 @@
+// XXX Still doesn't work in Discord
+
 // sudo modprobe v4l2loopback exclusive_caps=1
-// v4l2loopback-ctl set-caps video/x-raw,format=UYVY,width=640,height=480 /dev/video0
+// NOT USED: v4l2loopback-ctl set-caps video/x-raw,format=UYVY,width=640,height=480 /dev/video0
 
 #include <cassert>
 #include <iostream>
@@ -20,24 +22,38 @@ using std::cout;
 using std::cerr;
 using std::endl;
 
+typedef float prec;
 constexpr int kOutWidth = 640;
 constexpr int kOutHeight = 480;
-constexpr float kOutAspect = (float)kOutWidth / kOutHeight;
-constexpr float kLPFSlewRate = 0.01;
-constexpr float kBoundedMaxSlew = 1;
-constexpr float kBoundedMaxSlewAccel = 0.05;
+constexpr prec kOutAspect = (prec)kOutWidth / kOutHeight;
+// I put a lot of primes in here to try to keep the zoom algorithms
+// from converging on small binary fractions; I figured that would
+// allow the image smoothing algorithms to blur out shifts.  Sadly, it
+// didn't work.
+constexpr prec kLPFSlewRate = 1.0/101;
+constexpr prec kBoundedMaxSlew = 43.0/41.0;
+constexpr prec kBoundedMaxSlewAccel = 1.0/37;
+
+inline void
+dbgRect(cv::Mat &img __attribute__((unused)),
+        cv::Rect rec __attribute__((unused)),
+        const cv::Scalar &color __attribute__((unused)),
+        int thickness __attribute__((unused)) = 1,
+        int lineType __attribute__((unused)) = cv::LINE_8,
+        int shift __attribute__((unused)) = 0) {
+  //cv::rectangle(img, rec, color, thickness, lineType, shift);
+}
 
 // ABC
-template<typename T=float>
+template<typename T=prec>
 class SmoothMoverABC {
  public:
   explicit virtual operator T() const = 0;
   virtual void operator<<(T target) = 0;
 };
 
-
 // Simple low-pass filter.
-template<typename T=float>
+template<typename T=prec>
 class SmoothMoverLPF : public SmoothMoverABC<T> {
  public:
   explicit SmoothMoverLPF(T initial) : s_(initial) {};
@@ -56,7 +72,7 @@ class SmoothMoverLPF : public SmoothMoverABC<T> {
 
 // A constant acceleration, and bounded velocity.  (The acceleration
 // can be lower than the constant at the end of the slew.)
-template<typename T=float>
+template<typename T=prec>
 class SmoothMoverBoundedAccel : public SmoothMoverABC<T> {
  public:
   explicit SmoothMoverBoundedAccel(T initial) : s_(initial) {};
@@ -93,7 +109,7 @@ SmoothMoverBoundedAccel<T>::operator<<(T target) {
   }
 }
 
-template<typename R, typename S, typename T=float>
+template<typename R, typename S, typename T=prec>
 class SmoothMoverCompose : public SmoothMoverABC<T> {
  public:
   explicit SmoothMoverCompose(T initial) : r_(initial), s_(initial) {};
@@ -112,7 +128,16 @@ class SmoothMoverCompose : public SmoothMoverABC<T> {
   S s_;
 };
 
-template<typename T=float>
+// XXX After fiddling with this some, I think I came to an interesting
+// conclusion.  First, perception is better tuned to seeing scaling
+// effects than panning effects.  Second, it's probably better tuned
+// to pixel-scale jumps than non-pixel-scale jumps.  Third, the
+// "obvious" algorithms -- everything I can invent without lots of
+// work -- tend to build cutoffs are divisible by 4, and hence often
+// make pixel-scale jumps.  I think I should experiment within the
+// x:y:width:height framework (that cv::Rect does) instead of trying
+// to use x0:y0:x1:y1 like I do here.
+template<typename T=prec>
 class SmoothMovingRect {
  public:
   template<typename Q>
@@ -167,20 +192,20 @@ rectBound(std::vector<cv::Rect_<T>> &rects)
   return rv;
 }
 
-cv::Rect
-rectAdjust(cv::Rect rect, float aspect,
-           float scaleUp, float scaleDown, float scaleLeft, float scaleRight,
-           int minx, int miny, int maxx, int maxy)
+template<typename T> cv::Rect_<T>
+rectAdjust(cv::Rect_<T> rect, prec aspect,
+           prec scaleUp, prec scaleDown, prec scaleLeft, prec scaleRight,
+           T minx, T miny, T maxx, T maxy)
 {
   constexpr int convergence_iters = 32;
   
   // Scale
-  float centerx = rect.x + rect.width / 2.0;
-  float centery = rect.y + rect.height / 2.0;
-  float left = centerx - rect.width / 2.0 * scaleLeft;
-  float right = centerx + rect.width / 2.0 * scaleRight;
-  float top = centery - rect.height / 2.0 * scaleUp;
-  float bottom = centery + rect.height / 2.0 * scaleDown;
+  T centerx = rect.x + rect.width / 2.0;
+  T centery = rect.y + rect.height / 2.0;
+  T left = centerx - rect.width / 2.0 * scaleLeft;
+  T right = centerx + rect.width / 2.0 * scaleRight;
+  T top = centery - rect.height / 2.0 * scaleUp;
+  T bottom = centery + rect.height / 2.0 * scaleDown;
 
   int i;
   for (i = 0; i < convergence_iters; i++) {
@@ -196,9 +221,9 @@ rectAdjust(cv::Rect rect, float aspect,
     centery = (top + bottom) / 2.0;
     
     // XXX We can hit a singularity here.
-    int width = right - left;
-    int height = bottom - top;
-    float newAspect = (float)width / height;
+    prec width = right - left;
+    prec height = bottom - top;
+    prec newAspect = (prec)width / height;
     //cout << newAspect << " -> " << aspect << endl;
     if (newAspect < aspect - 0.01) {
       int desiredWidth = height * aspect;
@@ -216,7 +241,7 @@ rectAdjust(cv::Rect rect, float aspect,
   }
 
   static bool in_fallback;
-  static cv::Rect last_value(minx, miny, maxx-1, maxy-1);
+  static cv::Rect_<T> last_value(minx, miny, maxx-1, maxy-1);
   if (i == convergence_iters || (right <= left) || (bottom <= top)) {
     // Failed to converge.  Not really that surprising; the above
     // algorithm needs a lot of work.  Return a default.
@@ -233,7 +258,7 @@ rectAdjust(cv::Rect rect, float aspect,
     cerr << "Convergence resolved" << endl;
     in_fallback = false;
   }
-  last_value = cv::Rect(left, top, right - left, bottom - top);
+  last_value = cv::Rect_<T>(left, top, right - left, bottom - top);
   return last_value;
 }
 
@@ -278,7 +303,7 @@ main()
   cv::Mat output;
   std::vector<cv::Rect> faces;
 
-  SmoothMovingRect<float> roi(cv::Rect(0, 0, camWidth, camHeight));
+  SmoothMovingRect<prec> roi(cv::Rect(0, 0, camWidth, camHeight));
   
   for (;;) {
     cam >> frame;
@@ -289,32 +314,43 @@ main()
 
     if (faces.size() > 0) {
       cv::Rect faceBounds = rectBound(faces);
-      cv::rectangle(frame, faceBounds, cv::Scalar(0, 255, 0));
+      dbgRect(frame, faceBounds, cv::Scalar(0, 255, 0));
       roi << faceBounds;
     }
     // XXX The ROI can be backwards, and if so, this doesn't draw it.
-    cv::rectangle(frame, static_cast<cv::Rect>(roi), cv::Scalar(255, 0, 0));
-    auto xmit = rectAdjust(static_cast<cv::Rect>(roi), kOutAspect,
-                           // This should have scaleBottom ==
-                           // 2*scaleTop to have the eyes on the
-                           // rule-of-thirds boundary.  (It also
-                           // works well with my beard.)
-                           1.5, 3, 2, 2,
-                           0, 0, camWidth, camHeight);
-    cv::rectangle(frame, xmit, cv::Scalar(38, 38, 238));
+    dbgRect(frame, static_cast<cv::Rect>(roi), cv::Scalar(255, 0, 0));
+    auto xmit = rectAdjust<prec>(static_cast<cv::Rect>(roi), kOutAspect,
+                                 // This should have scaleBottom ==
+                                 // 2*scaleTop to have the eyes on the
+                                 // rule-of-thirds boundary.  (It also
+                                 // works well with my beard.)
+                                 1.5, 3, 2, 2,
+                                 0, 0, camWidth, camHeight);
+    dbgRect(frame, xmit, cv::Scalar(38, 38, 238));
 
+    //cout << xmit << endl;
+    
     try {
-      auto outCols = frame.colRange(xmit.x, xmit.x + xmit.width);
-      auto outColsRows = outCols.rowRange(xmit.y, xmit.y + xmit.height);
-      cv::resize(outColsRows, output, outSize, 0, 0, cv::INTER_AREA);
+      cv::Point2f src[]{
+                       {xmit.x, xmit.y},
+                       {xmit.x, xmit.y + xmit.height},
+                       {xmit.x + xmit.width, xmit.y + xmit.height}};
+      cv::Point2f dst[]{
+                       {0, 0},
+                       {0, kOutHeight},
+                       {kOutWidth, kOutHeight}};
+      auto xfrm = cv::getAffineTransform(src, dst);
+      cv::warpAffine(frame, output, xfrm,
+                     cv::Size{kOutWidth, kOutHeight},
+                     cv::INTER_CUBIC);
     } catch (cv::Exception &e) {
       // Debugging aid
       cerr << "Output " << xmit << endl;
       throw e;
     }
 
-    cv::imshow(opwin, frame);
-    cv::imshow(outwin, output);
+    //cv::imshow(opwin, frame);
+    //cv::imshow(outwin, output);
     cv::cvtColor(output, output, cv::COLOR_BGR2RGB);
     auto written = write(out_fd, output.data, kOutHeight * kOutWidth * 3);
     if (written < 0)
