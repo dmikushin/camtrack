@@ -14,7 +14,6 @@
 #include <fcntl.h>
 #include <unistd.h>
 
-#include <opencv2/core/cuda.hpp>
 #include <opencv2/highgui.hpp>
 #include <opencv2/imgproc.hpp>
 #include <opencv2/objdetect.hpp>
@@ -285,9 +284,9 @@ main()
   cv::VideoCapture cam(1, cv::CAP_V4L2);
   if (!cam.isOpened())
     errx(1, "open camera 1");
-  cam.set(cv::CAP_PROP_FOURCC, cv::VideoWriter::fourcc('M', 'J', 'P', 'G'));
-  cam.set(cv::CAP_PROP_FRAME_WIDTH, 1920);
-  cam.set(cv::CAP_PROP_FRAME_HEIGHT, 1080);
+  //cam.set(cv::CAP_PROP_FOURCC, cv::VideoWriter::fourcc('M', 'J', 'P', 'G'));
+  cam.set(cv::CAP_PROP_FRAME_WIDTH, 640);
+  cam.set(cv::CAP_PROP_FRAME_HEIGHT, 480);
 #define DUMP_PROP(x)                            \
   do {                                          \
       auto propVal = cam.get(cv:: x);           \
