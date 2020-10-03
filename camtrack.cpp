@@ -4,6 +4,7 @@
 // NOT USED: v4l2loopback-ctl set-caps video/x-raw,format=UYVY,width=640,height=480 /dev/video0
 
 #include <cassert>
+#include <cmath>
 #include <iostream>
 
 #include <sys/ioctl.h>
@@ -24,7 +25,7 @@ using std::endl;
 
 typedef float prec;
 constexpr int kOutWidth = 640;
-constexpr int kOutHeight = 480;
+constexpr int kOutHeight = 360;
 constexpr prec kOutAspect = (prec)kOutWidth / kOutHeight;
 // I put a lot of primes in here to try to keep the zoom algorithms
 // from converging on small binary fractions; I figured that would
@@ -32,7 +33,7 @@ constexpr prec kOutAspect = (prec)kOutWidth / kOutHeight;
 // didn't work.
 constexpr prec kLPFSlewRate = 1.0/101;
 constexpr prec kBoundedMaxSlew = 43.0/41.0;
-constexpr prec kBoundedMaxSlewAccel = 1.0/37;
+constexpr prec kBoundedMaxSlewAccel = 1.0/13;
 
 inline void
 dbgRect(cv::Mat &img __attribute__((unused)),
@@ -41,7 +42,7 @@ dbgRect(cv::Mat &img __attribute__((unused)),
         int thickness __attribute__((unused)) = 1,
         int lineType __attribute__((unused)) = cv::LINE_8,
         int shift __attribute__((unused)) = 0) {
-  //cv::rectangle(img, rec, color, thickness, lineType, shift);
+  cv::rectangle(img, rec, color, thickness, lineType, shift);
 }
 
 // ABC
@@ -141,125 +142,67 @@ template<typename T=prec>
 class SmoothMovingRect {
  public:
   template<typename Q>
-  SmoothMovingRect(cv::Rect_<Q> initial) 
-      : left_(initial.x), top_(initial.y),
-        right_(initial.x + initial.width),
-        bottom_(initial.y + initial.height) {};
+  SmoothMovingRect(cv::Rect_<Q> bounds) 
+      : bounds_(bounds),
+        aspect_(static_cast<T>(bounds.width) / bounds.height),
+        centerX_(bounds.x + static_cast<T>(bounds.width) / 2),
+        centerY_(bounds.y + static_cast<T>(bounds.height) / 2),
+        size_(bounds.width * bounds.height) {};
   SmoothMovingRect(const SmoothMovingRect&) = default;
   SmoothMovingRect& operator=(const SmoothMovingRect&) = default;
   SmoothMovingRect(SmoothMovingRect&&) = default;
   SmoothMovingRect& operator=(SmoothMovingRect&&) = default;
 
   template<typename Q>
-  explicit operator cv::Rect_<Q>() const {
-    return cv::Rect_<Q>(static_cast<T>(left_),
-                        static_cast<T>(top_),
-                        static_cast<T>(right_) - static_cast<T>(left_),
-                        static_cast<T>(bottom_) - static_cast<T>(top_));
+  cv::Rect_<Q> scale(T factor, T verticalPositioning) const;
+  template<typename Q> explicit operator cv::Rect_<Q>() const {
+    return scale<Q>(1, 0.5);
   }
   void operator<<(const cv::Rect_<T>&);
   
  private:
+  const cv::Rect_<T> bounds_;
+  const T aspect_;
   SmoothMoverCompose<SmoothMoverBoundedAccel<T>,
                      SmoothMoverLPF<T>,
                      T>
-  left_, top_, right_, bottom_;
+  centerX_, centerY_;
+  SmoothMoverLPF<T> size_;
 };
+
+template<typename T> template<typename Q>
+cv::Rect_<Q>
+SmoothMovingRect<T>::scale(T factor, T verticalPositioning) const {
+  T size = static_cast<T>(size_) * factor;
+  T aspect = aspect_;
+  T height = std::sqrt(size / aspect);
+  T width = aspect * height;
+  T x = static_cast<T>(centerX_) - (width / 2);
+  T y = static_cast<T>(centerY_) - (height * verticalPositioning);
+  // XXX Respect the bounds (we currently let the affine transform do
+  // border stuff)
+  return cv::Rect_<Q>(x, y, width, height);
+}
 
 template<typename T> void
 SmoothMovingRect<T>::operator<<(const cv::Rect_<T>& target) {
-  left_ << target.x;
-  right_ << target.x + target.width;
-  top_ << target.y;
-  bottom_ << target.y + target.height;
+  centerX_ << target.x + target.width / 2;
+  centerY_ << target.y + target.height / 2;
+  size_ << target.width * target.height;
+  cout << static_cast<T>(centerX_) << ","
+       << static_cast<T>(centerY_) << " @ "
+       << static_cast<T>(size_) << endl;
 }
 
 template<typename T> cv::Rect_<T>
-rectBound(std::vector<cv::Rect_<T>> &rects)
+rectBound(const std::vector<cv::Rect_<T>> &rects)
 {
   assert(!rects.empty());
   cv::Rect_<T> rv = rects[0];
   for (size_t i = 1; i < rects.size(); i++) {
-    if (rects[i].x < rv.x)
-      rv.x = rects[i].x;
-    if (rects[i].x + rects[i].width < rv.x + rv.width)
-      rv.width = rects[i].x + rects[i].width - rv.x;
-    if (rects[i].y < rv.y)
-      rv.y = rects[i].y;
-    if (rects[i].y + rects[i].height < rv.y + rv.height)
-      rv.height = rects[i].y + rects[i].height - rv.y;
+    rv |= rects[i];
   }
   return rv;
-}
-
-template<typename T> cv::Rect_<T>
-rectAdjust(cv::Rect_<T> rect, prec aspect,
-           prec scaleUp, prec scaleDown, prec scaleLeft, prec scaleRight,
-           T minx, T miny, T maxx, T maxy)
-{
-  constexpr int convergence_iters = 32;
-  
-  // Scale
-  T centerx = rect.x + rect.width / 2.0;
-  T centery = rect.y + rect.height / 2.0;
-  T left = centerx - rect.width / 2.0 * scaleLeft;
-  T right = centerx + rect.width / 2.0 * scaleRight;
-  T top = centery - rect.height / 2.0 * scaleUp;
-  T bottom = centery + rect.height / 2.0 * scaleDown;
-
-  int i;
-  for (i = 0; i < convergence_iters; i++) {
-    if (left < minx)
-      left = minx;
-    if (right > maxx)
-      right = maxx;
-    if (top < miny)
-      top = miny;
-    if (bottom > maxy)
-      bottom = maxy;
-    centerx = (left + right) / 2.0;
-    centery = (top + bottom) / 2.0;
-    
-    // XXX We can hit a singularity here.
-    prec width = right - left;
-    prec height = bottom - top;
-    prec newAspect = (prec)width / height;
-    //cout << newAspect << " -> " << aspect << endl;
-    if (newAspect < aspect - 0.01) {
-      int desiredWidth = height * aspect;
-      left = centerx - desiredWidth / 2;
-      right = left + desiredWidth;
-      continue;
-    }
-    if (newAspect > aspect + 0.01) {
-      int desiredHeight = width / aspect;
-      top = centery - desiredHeight / 2;
-      bottom = top + desiredHeight;
-      continue;
-    }
-    break;
-  }
-
-  static bool in_fallback;
-  static cv::Rect_<T> last_value(minx, miny, maxx-1, maxy-1);
-  if (i == convergence_iters || (right <= left) || (bottom <= top)) {
-    // Failed to converge.  Not really that surprising; the above
-    // algorithm needs a lot of work.  Return a default.
-    // In my tests so far, this will go in and out of fallback
-    // rapidly for several frames, and then resolve long-term.    
-    if (!in_fallback) {
-      cerr << "CONVERGENCE FAILURE" << endl;
-      in_fallback = true;
-    }
-    return last_value;
-  }
-
-  if (in_fallback) {
-    cerr << "Convergence resolved" << endl;
-    in_fallback = false;
-  }
-  last_value = cv::Rect_<T>(left, top, right - left, bottom - top);
-  return last_value;
 }
 
 int
@@ -288,10 +231,77 @@ main()
   cv::VideoCapture cam(1, cv::CAP_V4L2);
   if (!cam.isOpened())
     errx(1, "open camera 1");
-  cout << "opened using " << cam.getBackendName() << endl;
+  cam.set(cv::CAP_PROP_FOURCC, cv::VideoWriter::fourcc('M', 'J', 'P', 'G'));
+  //cam.set(cv::CAP_PROP_FRAME_WIDTH, 1920);
+  //cam.set(cv::CAP_PROP_FRAME_HEIGHT, 1080);
+#define DUMP_PROP(x)                            \
+  do {                                          \
+      auto propVal = cam.get(cv:: x);           \
+      if (propVal != -1)                        \
+        cout << #x << ": " << propVal << endl;  \
+  } while (0)
+  DUMP_PROP(CAP_PROP_POS_MSEC);
+  DUMP_PROP(CAP_PROP_POS_FRAMES);
+  DUMP_PROP(CAP_PROP_POS_AVI_RATIO);
+  DUMP_PROP(CAP_PROP_FRAME_WIDTH);
+  DUMP_PROP(CAP_PROP_FRAME_HEIGHT);
+  DUMP_PROP(CAP_PROP_FPS);
+  DUMP_PROP(CAP_PROP_FOURCC);
+  DUMP_PROP(CAP_PROP_FRAME_COUNT);
+  DUMP_PROP(CAP_PROP_FORMAT);
+  DUMP_PROP(CAP_PROP_MODE);
+  DUMP_PROP(CAP_PROP_BRIGHTNESS);
+  DUMP_PROP(CAP_PROP_CONTRAST);
+  DUMP_PROP(CAP_PROP_SATURATION);
+  DUMP_PROP(CAP_PROP_HUE);
+  DUMP_PROP(CAP_PROP_GAIN);
+  DUMP_PROP(CAP_PROP_EXPOSURE);
+  DUMP_PROP(CAP_PROP_CONVERT_RGB);
+  DUMP_PROP(CAP_PROP_WHITE_BALANCE_BLUE_U);
+  DUMP_PROP(CAP_PROP_RECTIFICATION);
+  DUMP_PROP(CAP_PROP_MONOCHROME);
+  DUMP_PROP(CAP_PROP_SHARPNESS);
+  DUMP_PROP(CAP_PROP_AUTO_EXPOSURE);
+  DUMP_PROP(CAP_PROP_GAMMA);
+  DUMP_PROP(CAP_PROP_TEMPERATURE);
+  DUMP_PROP(CAP_PROP_TRIGGER);
+  DUMP_PROP(CAP_PROP_TRIGGER_DELAY);
+  DUMP_PROP(CAP_PROP_WHITE_BALANCE_RED_V);
+  DUMP_PROP(CAP_PROP_ZOOM);
+  DUMP_PROP(CAP_PROP_FOCUS);
+  DUMP_PROP(CAP_PROP_GUID);
+  DUMP_PROP(CAP_PROP_ISO_SPEED);
+  DUMP_PROP(CAP_PROP_BACKLIGHT);
+  DUMP_PROP(CAP_PROP_PAN);
+  DUMP_PROP(CAP_PROP_TILT);
+  DUMP_PROP(CAP_PROP_ROLL);
+  DUMP_PROP(CAP_PROP_IRIS);
+  DUMP_PROP(CAP_PROP_SETTINGS);
+  DUMP_PROP(CAP_PROP_BUFFERSIZE);
+  DUMP_PROP(CAP_PROP_AUTOFOCUS);
+  DUMP_PROP(CAP_PROP_SAR_NUM);
+  DUMP_PROP(CAP_PROP_SAR_DEN);
+  DUMP_PROP(CAP_PROP_BACKEND);
+  DUMP_PROP(CAP_PROP_CHANNEL);
+  DUMP_PROP(CAP_PROP_AUTO_WB);
+  DUMP_PROP(CAP_PROP_WB_TEMPERATURE);
+  DUMP_PROP(CAP_PROP_CODEC_PIXEL_FORMAT);
+  //DUMP_PROP(CAP_PROP_BITRATE);
+  //DUMP_PROP(CAP_PROP_ORIENTATION_META);
+  //DUMP_PROP(CAP_PROP_ORIENTATION_AUTO);
+  
   int camWidth = cam.get(cv::CAP_PROP_FRAME_WIDTH);
   int camHeight = cam.get(cv::CAP_PROP_FRAME_HEIGHT);
   cv::Size outSize(kOutWidth, kOutHeight);
+  cout << cam.getBackendName() << " frame size "
+       << camWidth << "x" << camHeight << endl;
+  uint32_t fourcc = cam.get(cv::CAP_PROP_FOURCC);
+  cout << "fourcc: "
+       << static_cast<char>((fourcc >>  0) & 0x7f)
+       << static_cast<char>((fourcc >>  8) & 0x7f)
+       << static_cast<char>((fourcc >> 16) & 0x7f)
+       << static_cast<char>((fourcc >> 24) & 0x7f)
+       << endl;
   
   std::string opwin("CamTrack Operator");
   std::string outwin("CamTrack Output");
@@ -317,15 +327,8 @@ main()
       dbgRect(frame, faceBounds, cv::Scalar(0, 255, 0));
       roi << faceBounds;
     }
-    // XXX The ROI can be backwards, and if so, this doesn't draw it.
     dbgRect(frame, static_cast<cv::Rect>(roi), cv::Scalar(255, 0, 0));
-    auto xmit = rectAdjust<prec>(static_cast<cv::Rect>(roi), kOutAspect,
-                                 // This should have scaleBottom ==
-                                 // 2*scaleTop to have the eyes on the
-                                 // rule-of-thirds boundary.  (It also
-                                 // works well with my beard.)
-                                 1.5, 3, 2, 2,
-                                 0, 0, camWidth, camHeight);
+    auto xmit = roi.scale<prec>(4, 5.0/12);
     dbgRect(frame, xmit, cv::Scalar(38, 38, 238));
 
     //cout << xmit << endl;
@@ -349,8 +352,8 @@ main()
       throw e;
     }
 
-    //cv::imshow(opwin, frame);
-    //cv::imshow(outwin, output);
+    cv::imshow(opwin, frame);
+    cv::imshow(outwin, output);
     cv::cvtColor(output, output, cv::COLOR_BGR2RGB);
     auto written = write(out_fd, output.data, kOutHeight * kOutWidth * 3);
     if (written < 0)
