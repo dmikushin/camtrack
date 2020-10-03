@@ -15,6 +15,10 @@
 #include <unistd.h>
 
 #include <opencv2/core/cuda.hpp>
+#include <opencv2/cudacodec.hpp>
+#include <opencv2/cudaimgproc.hpp>
+#include <opencv2/cudaobjdetect.hpp>
+#include <opencv2/cudawarping.hpp>
 #include <opencv2/highgui.hpp>
 #include <opencv2/imgproc.hpp>
 #include <opencv2/objdetect.hpp>
@@ -259,12 +263,96 @@ rectBound(const std::vector<cv::Rect_<T>> &rects)
   return rv;
 }
 
+class RawV4L2CudaSource : public cv::cudacodec::RawVideoSource {
+ public:
+  explicit RawV4L2CudaSource(const char* filename);
+  RawV4L2CudaSource(const RawV4L2CudaSource&) = delete;
+  RawV4L2CudaSource& operator=(const RawV4L2CudaSource&) = delete;
+  RawV4L2CudaSource(RawV4L2CudaSource&&) = delete;
+  RawV4L2CudaSource& operator=(RawV4L2CudaSource&&) = delete;
+
+  virtual ~RawV4L2CudaSource() override;
+  virtual cv::cudacodec::FormatInfo format() const override;
+  virtual bool getNextPacket(unsigned char **data, size_t *size) override;
+
+  int width() const { return width_; }
+  int height() const { return height_; }
+  
+ private:
+  int fd_;
+  struct v4l2_format vid_format_;
+  //cv::cuda::HostMem buf_(cv::cuda::HostMem::AllocType::WRITE_COMBINED);
+  std::vector<char> buf_;
+  int width_ = 0, height_ = 0;
+};
+
+RawV4L2CudaSource::RawV4L2CudaSource(const char* filename) {
+  fd_ = open(filename, O_RDWR);
+  if (fd_ < 0)
+    err(1, filename);
+
+  memset(&vid_format_, 0, sizeof(vid_format_));
+  vid_format_.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+  if (ioctl(fd_, VIDIOC_G_FMT, &vid_format_) < 0)
+    err(1, "%s: initial VIDIOC_G_FMT", filename);
+  vid_format_.fmt.pix.width = 1920;
+  vid_format_.fmt.pix.height = 1080;
+  vid_format_.fmt.pix.pixelformat = V4L2_PIX_FMT_JPEG;
+  vid_format_.fmt.pix.field = V4L2_FIELD_NONE;
+  vid_format_.fmt.pix.bytesperline = 0;
+  vid_format_.fmt.pix.sizeimage = 0;
+  vid_format_.fmt.pix.priv = 0;
+  if (ioctl(fd_, VIDIOC_S_FMT, &vid_format_) < 0)
+    err(1, "%s: VIDIOC_S_FMT", filename);
+  // Record what we got
+  if (ioctl(fd_, VIDIOC_G_FMT, &vid_format_) < 0)
+    err(1, "%s: followup VIDIOC_G_FMT", filename);
+
+  //buf_.create(1, vid_format_.fmt.pix.sizeimage, CV_8U);
+  buf_.resize(vid_format_.fmt.pix.sizeimage);
+  width_ = vid_format_.fmt.pix.width;
+  height_ = vid_format_.fmt.pix.height;  
+}
+  
+RawV4L2CudaSource::~RawV4L2CudaSource() {
+  if (close(fd_) < 0)
+    err(1, "close camera");
+}
+
+cv::cudacodec::FormatInfo
+RawV4L2CudaSource::format() const {
+  cv::cudacodec::FormatInfo rv;
+  memset(&rv, 0, sizeof(rv));
+  assert(vid_format_.fmt.pix.pixelformat == V4L2_PIX_FMT_JPEG);
+  // The only format that the decoder supports is 8-bit YUV420.
+  // (Actually, it uses NV12 internally.)  FIXME Verify this (cf
+  // V4L2_JPEG_CHROMA_SUBSAMPLING_420 etc)
+  rv.chromaFormat = cv::cudacodec::ChromaFormat::YUV420;
+  rv.codec = cv::cudacodec::Codec::JPEG;
+  rv.width = vid_format_.fmt.pix.width;
+  rv.height = vid_format_.fmt.pix.height;
+  return rv;
+}
+  
+bool
+RawV4L2CudaSource::getNextPacket(unsigned char **data, size_t *size) {
+  *data = static_cast<unsigned char*>(static_cast<void*>(buf_.data()));
+  auto read_result = read(fd_, *data, vid_format_.fmt.pix.sizeimage);
+  if (read_result < 0)
+    err(1, "read frame");
+  *size = read_result;
+  return (read_result != 0);
+}
+
 int
 main()
 {
-  cv::CascadeClassifier face_cascade;
-  if (!face_cascade.load("haarcascade_frontalface_default.xml"))
-    err(1, "haarcascade_frontalface_default.xml");
+  cout << "CUDA devices: " << cv::cuda::getCudaEnabledDeviceCount() << endl;
+  cv::cuda::setDevice(0);
+  cv::cuda::printShortCudaDeviceInfo(0);
+  
+  auto face_cascade = cv::cuda::CascadeClassifier::create(
+      "haarcascade_cuda.xml");
 
   int out_fd = open("/dev/video0", O_RDWR);
   if (out_fd < 0)
@@ -276,119 +364,64 @@ main()
     err(1, "VIDIOC_G_FMT");
   vid_format.fmt.pix.width = kOutWidth;
   vid_format.fmt.pix.height = kOutHeight;
+  // Chrome only supports:
+  // V4L2_PIX_FMT_YUV420, V4L2_PIX_FMT_Y16, V4L2_PIX_FMT_Z16, 
+  // V4L2_PIX_FMT_INVZ, V4L2_PIX_FMT_YUYV, V4L2_PIX_FMT_RGB24, 
+  // V4L2_PIX_FMT_MJPEG, V4L2_PIX_FMT_JPEG
   vid_format.fmt.pix.pixelformat = V4L2_PIX_FMT_RGB24;
   vid_format.fmt.pix.sizeimage = kOutHeight * kOutWidth * 3;
   vid_format.fmt.pix.field = V4L2_FIELD_NONE;
   if (ioctl(out_fd, VIDIOC_S_FMT, &vid_format) < 0)
     err(1, "VIDIOC_S_FMT");
-  
-  cv::VideoCapture cam(1, cv::CAP_V4L2);
-  if (!cam.isOpened())
-    errx(1, "open camera 1");
-  cam.set(cv::CAP_PROP_FOURCC, cv::VideoWriter::fourcc('M', 'J', 'P', 'G'));
-  cam.set(cv::CAP_PROP_FRAME_WIDTH, 1920);
-  cam.set(cv::CAP_PROP_FRAME_HEIGHT, 1080);
-#define DUMP_PROP(x)                            \
-  do {                                          \
-      auto propVal = cam.get(cv:: x);           \
-      if (propVal != -1)                        \
-        cout << #x << ": " << propVal << endl;  \
-  } while (0)
-  DUMP_PROP(CAP_PROP_POS_MSEC);
-  DUMP_PROP(CAP_PROP_POS_FRAMES);
-  DUMP_PROP(CAP_PROP_POS_AVI_RATIO);
-  DUMP_PROP(CAP_PROP_FRAME_WIDTH);
-  DUMP_PROP(CAP_PROP_FRAME_HEIGHT);
-  DUMP_PROP(CAP_PROP_FPS);
-  //DUMP_PROP(CAP_PROP_FOURCC);
-  DUMP_PROP(CAP_PROP_FRAME_COUNT);
-  DUMP_PROP(CAP_PROP_FORMAT);
-  DUMP_PROP(CAP_PROP_MODE);
-  DUMP_PROP(CAP_PROP_BRIGHTNESS);
-  DUMP_PROP(CAP_PROP_CONTRAST);
-  DUMP_PROP(CAP_PROP_SATURATION);
-  DUMP_PROP(CAP_PROP_HUE);
-  DUMP_PROP(CAP_PROP_GAIN);
-  DUMP_PROP(CAP_PROP_EXPOSURE);
-  DUMP_PROP(CAP_PROP_CONVERT_RGB);
-  DUMP_PROP(CAP_PROP_WHITE_BALANCE_BLUE_U);
-  DUMP_PROP(CAP_PROP_RECTIFICATION);
-  DUMP_PROP(CAP_PROP_MONOCHROME);
-  DUMP_PROP(CAP_PROP_SHARPNESS);
-  DUMP_PROP(CAP_PROP_AUTO_EXPOSURE);
-  DUMP_PROP(CAP_PROP_GAMMA);
-  DUMP_PROP(CAP_PROP_TEMPERATURE);
-  DUMP_PROP(CAP_PROP_TRIGGER);
-  DUMP_PROP(CAP_PROP_TRIGGER_DELAY);
-  DUMP_PROP(CAP_PROP_WHITE_BALANCE_RED_V);
-  DUMP_PROP(CAP_PROP_ZOOM);
-  DUMP_PROP(CAP_PROP_FOCUS);
-  DUMP_PROP(CAP_PROP_GUID);
-  DUMP_PROP(CAP_PROP_ISO_SPEED);
-  DUMP_PROP(CAP_PROP_BACKLIGHT);
-  DUMP_PROP(CAP_PROP_PAN);
-  DUMP_PROP(CAP_PROP_TILT);
-  DUMP_PROP(CAP_PROP_ROLL);
-  DUMP_PROP(CAP_PROP_IRIS);
-  DUMP_PROP(CAP_PROP_SETTINGS);
-  DUMP_PROP(CAP_PROP_BUFFERSIZE);
-  DUMP_PROP(CAP_PROP_AUTOFOCUS);
-  DUMP_PROP(CAP_PROP_SAR_NUM);
-  DUMP_PROP(CAP_PROP_SAR_DEN);
-  DUMP_PROP(CAP_PROP_BACKEND);
-  DUMP_PROP(CAP_PROP_CHANNEL);
-  DUMP_PROP(CAP_PROP_AUTO_WB);
-  DUMP_PROP(CAP_PROP_WB_TEMPERATURE);
-  DUMP_PROP(CAP_PROP_CODEC_PIXEL_FORMAT);
-  //DUMP_PROP(CAP_PROP_BITRATE);
-  //DUMP_PROP(CAP_PROP_ORIENTATION_META);
-  //DUMP_PROP(CAP_PROP_ORIENTATION_AUTO);
-  
-  int camWidth = cam.get(cv::CAP_PROP_FRAME_WIDTH);
-  int camHeight = cam.get(cv::CAP_PROP_FRAME_HEIGHT);
-  cv::Size outSize(kOutWidth, kOutHeight);
-  cout << cam.getBackendName() << " frame size "
-       << camWidth << "x" << camHeight << endl;
-  uint32_t fourcc = cam.get(cv::CAP_PROP_FOURCC);
-  cout << "fourcc: "
-       << static_cast<char>((fourcc >>  0) & 0x7f)
-       << static_cast<char>((fourcc >>  8) & 0x7f)
-       << static_cast<char>((fourcc >> 16) & 0x7f)
-       << static_cast<char>((fourcc >> 24) & 0x7f)
-       << endl;
+
+  auto cam_source = cv::makePtr<RawV4L2CudaSource>("/dev/video1");
+  auto cam = cv::cudacodec::createVideoReader(cam_source);
   
   std::string opwin("CamTrack Operator");
   std::string outwin("CamTrack Output");
-  cv::namedWindow(opwin);
-  cv::namedWindow(outwin);
-  
-  cv::Mat frame;
-  cv::Mat frame_gray;
-  cv::Mat output;
-  std::vector<cv::Rect> faces;
+  cv::namedWindow(opwin, cv::WINDOW_OPENGL);
+  cv::namedWindow(outwin, cv::WINDOW_OPENGL);
 
-  SmoothMovingRect<prec> roi(cv::Rect(0, 0, camWidth, camHeight), kOutAspect);
+  cv::cuda::Stream background;
+  cv::cuda::Stream operator_stream;
+  
+  cv::cuda::GpuMat input;
+  cv::cuda::GpuMat input_gray;
+  cv::Mat operator_display;
+  cv::cuda::GpuMat faces_gpu;
+  std::vector<cv::Rect> faces_cpu;
+  cv::cuda::GpuMat output;
+  cv::Mat output_cpu;
+
+  SmoothMovingRect<prec> roi(cv::Rect(
+      0, 0, cam_source->width(), cam_source->height()), kOutAspect);
 
   int interval_frames = 0;
   auto interval_start = std::chrono::steady_clock::now();
-  
-  for (;;) {
-    cam >> frame;
 
-    cv::cvtColor(frame, frame_gray, cv::COLOR_BGR2GRAY);
-    cv::equalizeHist(frame_gray, frame_gray);
-    face_cascade.detectMultiScale(frame_gray, faces);
+  // cv::cudacodec outputs its frames in BGRA, it seems.
+  // (See videoDecPostProcessFrame)
+  while(cam->nextFrame(input)) {
+    cv::cuda::cvtColor(input, input_gray, cv::COLOR_BGRA2GRAY, 0, background);
+    cv::cuda::equalizeHist(input_gray, input_gray, background);
+    face_cascade->detectMultiScale(input_gray, faces_gpu, background);
+    input.download(operator_display, operator_stream);
 
-    if (faces.size() > 0) {
-      cv::Rect faceBounds = rectBound(faces);
-      dbgRect(frame, faceBounds, cv::Scalar(0, 255, 0));
+    background.waitForCompletion();
+    face_cascade->convert(faces_gpu, faces_cpu);
+
+    operator_stream.waitForCompletion();
+    if (faces_cpu.size() > 0) {
+      cv::Rect faceBounds = rectBound(faces_cpu);
+      dbgRect(operator_display, faceBounds, cv::Scalar(0, 255, 0));
       roi << faceBounds;
     }
-    dbgRect(frame, static_cast<cv::Rect>(roi), cv::Scalar(255, 0, 0));
+    dbgRect(operator_display,
+            static_cast<cv::Rect>(roi), cv::Scalar(255, 0, 0));
     auto xmit = roi.scale<prec>(4, 5.0/12);
-    dbgRect(frame, xmit, cv::Scalar(38, 38, 238));
+    dbgRect(operator_display, xmit, cv::Scalar(38, 38, 238));
 
-    //cout << xmit << endl;
+    cout << xmit << endl;
     
     try {
       cv::Point2f src[]{
@@ -400,19 +433,25 @@ main()
                        {0, kOutHeight},
                        {kOutWidth, kOutHeight}};
       auto xfrm = cv::getAffineTransform(src, dst);
-      cv::warpAffine(frame, output, xfrm,
-                     cv::Size{kOutWidth, kOutHeight},
-                     cv::INTER_LINEAR);
+      cv::cuda::warpAffine(input, output, xfrm,
+                           cv::Size{kOutWidth, kOutHeight},
+                           cv::INTER_LINEAR,
+                           cv::BORDER_CONSTANT,
+                           cv::Scalar(),
+                           background);
     } catch (cv::Exception &e) {
       // Debugging aid
       cerr << "Output " << xmit << endl;
       throw e;
     }
 
-    cv::imshow(opwin, frame);
+    cv::imshow(opwin, operator_display);
+    background.waitForCompletion();  // Wait for the affine transform
     cv::imshow(outwin, output);
-    cv::cvtColor(output, output, cv::COLOR_BGR2RGB);
-    auto written = write(out_fd, output.data, kOutHeight * kOutWidth * 3);
+    cv::cuda::cvtColor(output, output, cv::COLOR_BGRA2RGB, 0, background);
+    output.download(output_cpu, background);
+    background.waitForCompletion();  // Wait for the download
+    auto written = write(out_fd, output_cpu.data, kOutHeight * kOutWidth * 3);
     if (written < 0)
       err(1, "write frame");
     
