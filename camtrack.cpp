@@ -1,8 +1,3 @@
-// XXX Still doesn't work in Discord
-
-// sudo modprobe v4l2loopback exclusive_caps=1
-// NOT USED: v4l2loopback-ctl set-caps video/x-raw,format=UYVY,width=640,height=480 /dev/video0
-
 #include <cassert>
 #include <chrono>
 #include <cmath>
@@ -275,16 +270,18 @@ main()
     err(1, "VIDIOC_G_FMT");
   vid_format.fmt.pix.width = kOutWidth;
   vid_format.fmt.pix.height = kOutHeight;
-  vid_format.fmt.pix.pixelformat = V4L2_PIX_FMT_RGB24;
-  vid_format.fmt.pix.sizeimage = kOutHeight * kOutWidth * 3;
+  // Discord likes YUV420 (aka I420); it doesn't like RGB.
+  vid_format.fmt.pix.pixelformat = V4L2_PIX_FMT_YUV420;
+  vid_format.fmt.pix.sizeimage = kOutHeight * kOutWidth * 3 / 2;
   vid_format.fmt.pix.field = V4L2_FIELD_NONE;
   if (ioctl(out_fd, VIDIOC_S_FMT, &vid_format) < 0)
     err(1, "VIDIOC_S_FMT");
   
-  cv::VideoCapture cam(1, cv::CAP_V4L2);
+  cv::VideoCapture cam(2, cv::CAP_V4L2);
   if (!cam.isOpened())
-    errx(1, "open camera 1");
+    errx(1, "open camera 2");
   //cam.set(cv::CAP_PROP_FOURCC, cv::VideoWriter::fourcc('M', 'J', 'P', 'G'));
+  //cam.set(cv::CAP_PROP_FOURCC, cv::VideoWriter::fourcc('Y', 'U', 'Y', 'V'));
   cam.set(cv::CAP_PROP_FRAME_WIDTH, 640);
   cam.set(cv::CAP_PROP_FRAME_HEIGHT, 480);
 #define DUMP_PROP(x)                            \
@@ -378,14 +375,12 @@ main()
     cv::equalizeHist(frame_gray, frame_gray);
     face_cascade.detectMultiScale(frame_gray, faces);
 
+    cv::Rect faceBounds;
     if (faces.size() > 0) {
-      cv::Rect faceBounds = rectBound(faces);
-      dbgRect(frame, faceBounds, cv::Scalar(0, 255, 0));
+      faceBounds = rectBound(faces);
       roi << faceBounds;
     }
-    dbgRect(frame, static_cast<cv::Rect>(roi), cv::Scalar(255, 0, 0));
-    auto xmit = roi.scale<prec>(4, 5.0/12);
-    dbgRect(frame, xmit, cv::Scalar(38, 38, 238));
+    auto xmit = roi.scale<prec>(7, 5.0/12);
 
     //cout << xmit << endl;
     
@@ -408,10 +403,18 @@ main()
       throw e;
     }
 
+    // Now that the output has been drawn, we can draw on the operator
+    // window.
+    if (faces.size() > 0) {
+      dbgRect(frame, faceBounds, cv::Scalar(0, 255, 0));
+    }
+    dbgRect(frame, static_cast<cv::Rect>(roi), cv::Scalar(255, 0, 0));
+    dbgRect(frame, xmit, cv::Scalar(38, 38, 238));
+
     cv::imshow(opwin, frame);
     cv::imshow(outwin, output);
-    cv::cvtColor(output, output, cv::COLOR_BGR2RGB);
-    auto written = write(out_fd, output.data, kOutHeight * kOutWidth * 3);
+    cv::cvtColor(output, output, cv::COLOR_BGR2YUV_I420);
+    auto written = write(out_fd, output.data, kOutHeight * kOutWidth * 3 / 2);
     if (written < 0)
       err(1, "write frame");
     
