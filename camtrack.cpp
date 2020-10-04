@@ -368,8 +368,9 @@ main()
   // V4L2_PIX_FMT_YUV420, V4L2_PIX_FMT_Y16, V4L2_PIX_FMT_Z16, 
   // V4L2_PIX_FMT_INVZ, V4L2_PIX_FMT_YUYV, V4L2_PIX_FMT_RGB24, 
   // V4L2_PIX_FMT_MJPEG, V4L2_PIX_FMT_JPEG
-  vid_format.fmt.pix.pixelformat = V4L2_PIX_FMT_RGB24;
-  vid_format.fmt.pix.sizeimage = kOutHeight * kOutWidth * 3;
+  // Discord doesn't work with RGB24, but does with YUV420.
+  vid_format.fmt.pix.pixelformat = V4L2_PIX_FMT_YUV420;
+  vid_format.fmt.pix.sizeimage = kOutHeight * kOutWidth * 3 / 2;
   vid_format.fmt.pix.field = V4L2_FIELD_NONE;
   if (ioctl(out_fd, VIDIOC_S_FMT, &vid_format) < 0)
     err(1, "VIDIOC_S_FMT");
@@ -448,10 +449,11 @@ main()
     cv::imshow(opwin, operator_display);
     background.waitForCompletion();  // Wait for the affine transform
     cv::imshow(outwin, output);
-    cv::cuda::cvtColor(output, output, cv::COLOR_BGRA2RGB, 0, background);
+    cv::cuda::cvtColor(output, output, cv::COLOR_BGRA2YUV_I420, 0, background);
     output.download(output_cpu, background);
     background.waitForCompletion();  // Wait for the download
-    auto written = write(out_fd, output_cpu.data, kOutHeight * kOutWidth * 3);
+    auto written = write(out_fd, output_cpu.data,
+                         kOutHeight * kOutWidth * 3 / 2);
     if (written < 0)
       err(1, "write frame");
     
