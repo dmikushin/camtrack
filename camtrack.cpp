@@ -359,9 +359,9 @@ main()
                            static_cast<std::function<void(void)>*>(acsVoid);
                        (*acsFunc)();
                      };
-  cv::createTrackbar("minimum size divisor", opwin, &minimumSizeDivisor, 64,
+  cv::createTrackbar("Minimum size divisor", opwin, &minimumSizeDivisor, 64,
                      acsCallback, &acsFunc);
-  cv::createTrackbar("classifier scale log2", opwin, &classifierPyrCount, 4,
+  cv::createTrackbar("Classifier prescale", opwin, &classifierPyrCount, 4,
                      acsCallback, &acsFunc);
   int initial = 20;
   cv::createTrackbar("Slew LPF weight", opwin, &initial, 50,
