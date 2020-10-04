@@ -1,0 +1,9 @@
+usr/include/opencv4/opencv2/cvv.hpp
+usr/include/opencv4/opencv2/cvv/call_meta_data.hpp
+usr/include/opencv4/opencv2/cvv/cvv.hpp
+usr/include/opencv4/opencv2/cvv/debug_mode.hpp
+usr/include/opencv4/opencv2/cvv/dmatch.hpp
+usr/include/opencv4/opencv2/cvv/filter.hpp
+usr/include/opencv4/opencv2/cvv/final_show.hpp
+usr/include/opencv4/opencv2/cvv/show_image.hpp
+usr/lib/x86_64-linux-gnu/libopencv_cvv.a
