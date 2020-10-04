@@ -494,7 +494,7 @@ main()
     if (written < 0)
       err(1, "write frame");
 
-    cv::waitKey(10);
+    cv::waitKey(1);
 
     interval_frames++;
     auto now = std::chrono::steady_clock::now();
