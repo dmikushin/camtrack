@@ -1,8 +1,3 @@
-// XXX Still doesn't work in Discord
-
-// sudo modprobe v4l2loopback exclusive_caps=1
-// NOT USED: v4l2loopback-ctl set-caps video/x-raw,format=UYVY,width=640,height=480 /dev/video0
-
 #include <cassert>
 #include <chrono>
 #include <cmath>
@@ -412,15 +407,12 @@ main()
     face_cascade->convert(faces_gpu, faces_cpu);
 
     operator_stream.waitForCompletion();
+    cv::Rect faceBounds;
     if (faces_cpu.size() > 0) {
-      cv::Rect faceBounds = rectBound(faces_cpu);
-      dbgRect(operator_display, faceBounds, cv::Scalar(0, 255, 0));
+      faceBounds = rectBound(faces);
       roi << faceBounds;
     }
-    dbgRect(operator_display,
-            static_cast<cv::Rect>(roi), cv::Scalar(255, 0, 0));
-    auto xmit = roi.scale<prec>(4, 5.0/12);
-    dbgRect(operator_display, xmit, cv::Scalar(38, 38, 238));
+    auto xmit = roi.scale<prec>(7, 5.0/12);
 
     cout << xmit << endl;
     
@@ -446,6 +438,16 @@ main()
       throw e;
     }
 
+#if 0
+    // Now that the output has been drawn, we can draw on the operator
+    // window.
+    if (faces.size() > 0) {
+      dbgRect(frame, faceBounds, cv::Scalar(0, 255, 0));
+    }
+    dbgRect(frame, static_cast<cv::Rect>(roi), cv::Scalar(255, 0, 0));
+    dbgRect(frame, xmit, cv::Scalar(38, 38, 238));
+#endif
+    
     cv::imshow(opwin, operator_display);
     background.waitForCompletion();  // Wait for the affine transform
     cv::imshow(outwin, output);
