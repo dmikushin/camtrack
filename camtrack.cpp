@@ -11,37 +11,43 @@
 #include <unistd.h>
 
 #include <opencv2/core/cuda.hpp>
-#include <opencv2/cudacodec.hpp>
 #include <opencv2/cudaimgproc.hpp>
 #include <opencv2/cudaobjdetect.hpp>
 #include <opencv2/cudawarping.hpp>
 #include <opencv2/highgui.hpp>
 #include <opencv2/imgproc.hpp>
+#include <opencv2/videoio.hpp>
 
 using std::cout;
 using std::cerr;
 using std::endl;
 
 typedef float prec;
+constexpr int kOperScale = 4;
 constexpr int kOutWidth = 640;
 constexpr int kOutHeight = 480;
 constexpr prec kOutAspect = (prec)kOutWidth / kOutHeight;
-// I put a lot of primes in here to try to keep the zoom algorithms
-// from converging on small binary fractions; I figured that would
-// allow the image smoothing algorithms to blur out shifts.  Sadly, it
-// didn't work.
-constexpr prec kLPFSlewRate = 1.0/101;
-constexpr prec kBoundedMaxSlew = 43.0/41.0;
-constexpr prec kBoundedMaxSlewAccel = 1.0/13;
+// These rates are initialized in main.  They're more or less used as
+// constants, but there are knobs to adjust them.
+prec kLPFSlewRate;
+prec kBoundedMaxSlew;
+prec kBoundedMaxSlewAccel;
+prec kZoom;
+prec kEyes;
 
 inline void
 dbgRect(cv::Mat &img __attribute__((unused)),
-        cv::Rect rec __attribute__((unused)),
+        cv::Rect rect __attribute__((unused)),
         const cv::Scalar &color __attribute__((unused)),
         int thickness __attribute__((unused)) = 1,
         int lineType __attribute__((unused)) = cv::LINE_8,
         int shift __attribute__((unused)) = 0) {
-  cv::rectangle(img, rec, color, thickness, lineType, shift);
+  cv::rectangle(img,
+                cv::Rect(rect.x/kOperScale,
+                         rect.y/kOperScale,
+                         rect.width/kOperScale,
+                         rect.height/kOperScale),
+                color, thickness, lineType, shift);
 }
 
 // ABC
@@ -257,181 +263,23 @@ rectBound(const std::vector<cv::Rect_<T>> &rects)
   return rv;
 }
 
-class RawV4L2CudaSource : public cv::cudacodec::RawVideoSource {
- public:
-  explicit RawV4L2CudaSource(const char* filename);
-  RawV4L2CudaSource(const RawV4L2CudaSource&) = delete;
-  RawV4L2CudaSource& operator=(const RawV4L2CudaSource&) = delete;
-  RawV4L2CudaSource(RawV4L2CudaSource&&) = delete;
-  RawV4L2CudaSource& operator=(RawV4L2CudaSource&&) = delete;
-
-  virtual ~RawV4L2CudaSource() override;
-  virtual cv::cudacodec::FormatInfo format() const override;
-  virtual bool getNextPacket(unsigned char **data, size_t *size) override;
-
-  int width() const { return width_; }
-  int height() const { return height_; }
-  
- private:
-  static constexpr int kNumBufs = 10;
-  int fd_;
-  struct v4l2_format vid_format_;
-  int width_ = 0, height_ = 0;
-  struct { unsigned char *data; size_t length; } bufs_[kNumBufs];
-  std::array<int, 4> last_bufs_{-1, -1, -1, -1};
-};
-
-RawV4L2CudaSource::RawV4L2CudaSource(const char* filename) {
-  fd_ = open(filename, O_RDWR);
-  if (fd_ < 0)
-    err(1, filename);
-
-  memset(&vid_format_, 0, sizeof(vid_format_));
-  vid_format_.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-  if (ioctl(fd_, VIDIOC_G_FMT, &vid_format_) < 0)
-    err(1, "%s: initial VIDIOC_G_FMT", filename);
-  vid_format_.fmt.pix.width = 1920;
-  vid_format_.fmt.pix.height = 1080;
-  vid_format_.fmt.pix.pixelformat = V4L2_PIX_FMT_MJPEG;
-  vid_format_.fmt.pix.field = V4L2_FIELD_NONE;
-  vid_format_.fmt.pix.bytesperline = 0;
-  vid_format_.fmt.pix.sizeimage = 0;
-  vid_format_.fmt.pix.priv = 0;
-  if (ioctl(fd_, VIDIOC_S_FMT, &vid_format_) < 0)
-    err(1, "%s: VIDIOC_S_FMT", filename);
-  // Record what we got
-  if (ioctl(fd_, VIDIOC_G_FMT, &vid_format_) < 0)
-    err(1, "%s: followup VIDIOC_G_FMT", filename);
-  width_ = vid_format_.fmt.pix.width;
-  height_ = vid_format_.fmt.pix.height;  
-
-  struct v4l2_capability caps;
-  memset(&caps, 0, sizeof(caps));
-  if (ioctl(fd_, VIDIOC_QUERYCAP, &caps) < 0)
-    err(1, "%s: VIDIOC_QUERYCAP", filename);
-  if ((caps.capabilities & (V4L2_CAP_DEVICE_CAPS | V4L2_CAP_STREAMING))
-      != (V4L2_CAP_DEVICE_CAPS | V4L2_CAP_STREAMING))
-    err(1, "%s: Doesn't support mmap", filename);
-
-  struct v4l2_requestbuffers reqbuf;
-  memset(&reqbuf, 0, sizeof(reqbuf));
-  reqbuf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-  reqbuf.memory = V4L2_MEMORY_MMAP;
-  reqbuf.count = kNumBufs;
-  if (ioctl(fd_, VIDIOC_REQBUFS, &reqbuf) < 0)
-    err(1, "%s: VIDIOC_REQBUFS", filename);
-  assert(reqbuf.count == kNumBufs);
-  for (int i = 0; i < kNumBufs; i++) {
-    struct v4l2_buffer buf;
-    memset(&buf, 0, sizeof(buf));
-    buf.index = i;
-    buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-    buf.memory = V4L2_MEMORY_MMAP;
-    if (ioctl(fd_, VIDIOC_QUERYBUF, &buf) < 0)
-      err(1, "%s: VIDIOC_QUERYBUF(%i)", filename, i);
-    bufs_[i].length = buf.length;
-    bufs_[i].data = static_cast<unsigned char*>(
-        mmap(NULL, buf.length,
-             PROT_READ | PROT_WRITE, /* recommended by l4v2? */
-             MAP_SHARED,             /* recommended? */
-             fd_, buf.m.offset));
-    if (bufs_[i].data == MAP_FAILED)
-      err(1, "%s: mmap(%i)", filename, i);
-    if (ioctl(fd_, VIDIOC_QBUF, &buf) < 0)
-      err(1, "%s: VIDIOC_QBUF(%i)", filename, i);
-  }
-
-  int one = 1;
-  if (ioctl(fd_, VIDIOC_STREAMON, &one) < 0)
-    err(1, "%s: VIDIOC_STREAMON", filename);
-}
-
-RawV4L2CudaSource::~RawV4L2CudaSource() {
-  for (int i = 0; i < kNumBufs; i++) {
-    int rv = munmap(bufs_[i].data, bufs_[i].length);
-    if (rv < 0)
-      err(1, "munmap(%i)", i);
-  }
-
-  struct v4l2_requestbuffers reqbuf;
-  memset(&reqbuf, 0, sizeof(reqbuf));
-  reqbuf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-  reqbuf.memory = V4L2_MEMORY_MMAP;
-  reqbuf.count = 0;
-  if (ioctl(fd_, VIDIOC_REQBUFS, &reqbuf) < 0)
-    err(1, "VIDIOC_REQBUFS(0) (during destructor)");
-
-  if (close(fd_) < 0)
-    err(1, "close camera");
-}
-
-cv::cudacodec::FormatInfo
-RawV4L2CudaSource::format() const {
-  cv::cudacodec::FormatInfo rv;
-  memset(&rv, 0, sizeof(rv));
-  assert(vid_format_.fmt.pix.pixelformat == V4L2_PIX_FMT_MJPEG);
-  // The only format that the decoder supports is 8-bit YUV420.
-  // (Actually, it uses NV12 internally.)  FIXME Verify this (cf
-  // V4L2_JPEG_CHROMA_SUBSAMPLING_420 etc)
-  rv.chromaFormat = cv::cudacodec::ChromaFormat::YUV420;
-  rv.codec = cv::cudacodec::Codec::JPEG;
-  rv.width = vid_format_.fmt.pix.width;
-  rv.height = vid_format_.fmt.pix.height;
-  return rv;
-}
-  
-bool
-RawV4L2CudaSource::getNextPacket(unsigned char **data, size_t *size) {
-  int last_buf = last_bufs_[0];
-  for (unsigned int i = 1; i < last_bufs_.size(); i++) {
-    last_bufs_[i-1] = last_bufs_[i];
-  }
-      
-  if (last_buf != -1) {
-    struct v4l2_buffer buf;
-    memset(&buf, 0, sizeof(buf));
-    buf.index = last_buf;
-    buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-    buf.memory = V4L2_MEMORY_MMAP;
-    if (ioctl(fd_, VIDIOC_QBUF, &buf) < 0)
-      err(1, "VIDIOC_QBUF(%i)", last_buf);
-    cout << "queued " << last_buf << endl;
-  }
-
-  struct v4l2_buffer buf;
-  memset(&buf, 0, sizeof(buf));
-  buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-  buf.memory = V4L2_MEMORY_MMAP;
-  if (ioctl(fd_, VIDIOC_DQBUF, &buf) < 0)
-    err(1, "VIDIOC_DQBUF");
-  if (buf.flags & V4L2_BUF_FLAG_ERROR)
-    errx(1, "VIDIOC_DQBUF returned a non-specific critical error");
-  last_bufs_.back() = buf.index;
-  *data = bufs_[buf.index].data;
-  *size = buf.bytesused;
-  cout << "dequeued " << buf.index << endl;
-
-#if 0
-  int dfd = open("foo.jpg", O_WRONLY | O_TRUNC | O_CREAT, 0666);
-  if (dfd < 0)
-    err(1, "foo.jpg");
-  write(dfd, *data, *size);
-  close(dfd);
-#endif
-  
-  return !(buf.flags & V4L2_BUF_FLAG_LAST);
-}
-
 int
 main()
 {
   cout << "CUDA devices: " << cv::cuda::getCudaEnabledDeviceCount() << endl;
   cv::cuda::setDevice(0);
   cv::cuda::printShortCudaDeviceInfo(0);
-  
+
+  // alt2: just spins the GPU
+  // alt_tree: doesn't recognize me
+  // alt: doesn't see me often
+  // default: lots of false positives
   auto face_cascade = cv::cuda::CascadeClassifier::create(
       "haarcascade_cuda.xml");
-
+  // The CPU and GPU defaults are listed here.
+  face_cascade->setScaleFactor(1.1);                  // 1.1, 1.2
+  face_cascade->setMinNeighbors(3);                   // 3, 4
+  
   int out_fd = open("/dev/video0", O_RDWR);
   if (out_fd < 0)
     err(1, "/dev/video0");
@@ -453,51 +301,147 @@ main()
   if (ioctl(out_fd, VIDIOC_S_FMT, &vid_format) < 0)
     err(1, "VIDIOC_S_FMT");
 
-  auto cam_source = cv::makePtr<RawV4L2CudaSource>("/dev/video2");
-  auto cam = cv::cudacodec::createVideoReader(cam_source);
-  
-  std::string opwin("CamTrack Operator");
-  std::string outwin("CamTrack Output");
-  cv::namedWindow(opwin, cv::WINDOW_OPENGL);
-  cv::namedWindow(outwin, cv::WINDOW_OPENGL);
+  // We use cv::VideoCapture instead of cv::cudacodec::VideoReader
+  // because my camera outputs its high-resolution images in 4:2:2.
+  // cv::cudacodec::VideoReader only works with 4:2:0 images.
+  // You can check a file's format with
+  // identify -format "%[jpeg:sampling-factor]\n" foo.jpg
+  //     4:4:4: 1x1,1x1,1x1
+  //     4:2:2: 2x1,1x1,1x1
+  //     4:2:0: 2x2,1x1,1x1
+  // I don't know why cv::cudacodec::VideoReader requires 4:2:0; it says
+  // it needs it to render to an NV12 surface.  But according to my
+  // experiment, my card (at least) can render YUV422 to NV12, or at
+  // least says it can.  While NV12 is essentially a reordering of I420,
+  // it can just throw away half the chroma to get it from I422.
+  cv::VideoCapture cam(2, cv::CAP_V4L2);
+  if (!cam.isOpened())
+    errx(1, "open camera 2");
+  cam.set(cv::CAP_PROP_FOURCC, cv::VideoWriter::fourcc('M', 'J', 'P', 'G'));
+  // At 1440x1080 and below, I can get 19fps after all the processing.
+  // But at 1920x1080, it drops to 14fps.
+  cam.set(cv::CAP_PROP_FRAME_WIDTH, 1440);
+  cam.set(cv::CAP_PROP_FRAME_HEIGHT, 1080);
+  int camWidth = cam.get(cv::CAP_PROP_FRAME_WIDTH);
+  int camHeight = cam.get(cv::CAP_PROP_FRAME_HEIGHT);
+  cv::Size outSize(kOutWidth, kOutHeight);
+  cout << cam.getBackendName() << " frame size "
+       << camWidth << "x" << camHeight << endl;
+  uint32_t fourcc = cam.get(cv::CAP_PROP_FOURCC);
+  cout << "fourcc: "
+       << static_cast<char>((fourcc >>  0) & 0x7f)
+       << static_cast<char>((fourcc >>  8) & 0x7f)
+       << static_cast<char>((fourcc >> 16) & 0x7f)
+       << static_cast<char>((fourcc >> 24) & 0x7f)
+       << endl;
 
+  std::string opwin("CamTrack Operator");
+  cv::namedWindow(opwin, cv::WINDOW_OPENGL);
+  cv::resizeWindow(opwin, camWidth/4, camHeight/4 + 200);
+  std::string outwin("CamTrack Output");
+  cv::namedWindow(outwin, cv::WINDOW_OPENGL);
+  cv::resizeWindow(outwin, kOutWidth, kOutHeight);
+
+  int minimumSizeDivisor = 10;
+  int classifierPyrCount = 0;
+  auto adjustCascadeSizes =
+      [camWidth, camHeight, &classifierPyrCount, face_cascade,
+       &minimumSizeDivisor] {
+        int minSize = (camWidth >> classifierPyrCount) / minimumSizeDivisor;
+        cout << minSize << endl;
+        face_cascade->setMinObjectSize(cv::Size(minSize, minSize));
+        face_cascade->setMaxObjectSize(cv::Size(minSize*10, minSize*10));
+      };
+  adjustCascadeSizes();
+  std::function<void(void)> acsFunc = adjustCascadeSizes;
+  auto acsCallback = [](int, void* acsVoid) {
+                       auto acsFunc =
+                           static_cast<std::function<void(void)>*>(acsVoid);
+                       (*acsFunc)();
+                     };
+  cv::createTrackbar("minimum size divisor", opwin, &minimumSizeDivisor, 64,
+                     acsCallback, &acsFunc);
+  cv::createTrackbar("classifier scale log2", opwin, &classifierPyrCount, 4,
+                     acsCallback, &acsFunc);
+  int initial = 20;
+  cv::createTrackbar("Slew LPF weight", opwin, &initial, 50,
+                     [](int pos, void*) {
+                       kLPFSlewRate = exp10(pos / -10.0);
+                     });
+  kLPFSlewRate = exp10(initial / -10.0);
+  initial = 10;
+  cv::createTrackbar("Slew vel", opwin, &initial, 20,
+                     [](int pos, void*) {
+                       kBoundedMaxSlew = pos / 10.0;
+                     });
+  kBoundedMaxSlew = initial / 10.0;
+  initial = 75;
+  cv::createTrackbar("Slew accel", opwin, &initial, 200,
+                     [](int pos, void*) {
+                       kBoundedMaxSlewAccel = pos / 1000.0;
+                     });
+  kBoundedMaxSlew = initial / 1000.0;
+  initial = 60;
+  cv::createTrackbar("Zoom", opwin, &initial, 150,
+                     [](int pos, void*) {
+                       kZoom = (pos+1) / 10.0;
+                     });
+  kZoom = initial / 10.0;
+  initial = 40;
+  cv::createTrackbar("Eyes", opwin, &initial, 120,
+                     [](int pos, void*) {
+                       kEyes = pos / 120.0;
+                     });
+  kEyes = initial / 120.0;
+  
   cv::cuda::Stream background;
   cv::cuda::Stream operator_stream;
   
+  cv::Mat input_cpu;
   cv::cuda::GpuMat input;
   cv::cuda::GpuMat input_gray;
   cv::Mat operator_display;
+  cv::cuda::GpuMat operator_display_gpu;
   cv::cuda::GpuMat faces_gpu;
   std::vector<cv::Rect> faces_cpu;
   cv::cuda::GpuMat output;
   cv::Mat output_cpu;
 
-  SmoothMovingRect<prec> roi(cv::Rect(
-      0, 0, cam_source->width(), cam_source->height()), kOutAspect);
+  SmoothMovingRect<prec> roi(cv::Rect(0, 0, camWidth, camHeight), kOutAspect);
 
   int interval_frames = 0;
   auto interval_start = std::chrono::steady_clock::now();
 
-  // cv::cudacodec outputs its frames in BGRA, it seems.
-  // (See videoDecPostProcessFrame)
-  while(cam->nextFrame(input)) {
-    cv::cuda::cvtColor(input, input_gray, cv::COLOR_BGRA2GRAY, 0, background);
-    cv::cuda::equalizeHist(input_gray, input_gray, background);
-    face_cascade->detectMultiScale(input_gray, faces_gpu, background);
-    input.download(operator_display, operator_stream);
+  while (1) {
+    cam >> input_cpu;
 
+    input.upload(input_cpu, background);
+    cv::cuda::cvtColor(input, input_gray, cv::COLOR_BGR2GRAY, 0, background);
+    for (int i = 0; i < classifierPyrCount; i++)
+      cv::cuda::pyrDown(input_gray, input_gray, background);
+    cv::cuda::equalizeHist(input_gray, input_gray, background);
+    // The CUDA cascade classifier has a stream argument, but doesn't
+    // work with it (it asserts out).  We'll build our operator display
+    // while the rest is running, then start the classifier in the
+    // foreground.
+    cv::resize(input_cpu, operator_display, cv::Size(),
+               1.0/kOperScale, 1.0/kOperScale, cv::INTER_NEAREST);
     background.waitForCompletion();
+    face_cascade->detectMultiScale(input_gray, faces_gpu);
     face_cascade->convert(faces_gpu, faces_cpu);
 
-    operator_stream.waitForCompletion();
     cv::Rect faceBounds;
     if (faces_cpu.size() > 0) {
-      faceBounds = rectBound(faces_cpu);
+      cv::Rect faceBoundsUnscaled = rectBound(faces_cpu);
+      faceBounds = cv::Rect(faceBoundsUnscaled.x << classifierPyrCount,
+                            faceBoundsUnscaled.y << classifierPyrCount,
+                            faceBoundsUnscaled.width << classifierPyrCount,
+                            faceBoundsUnscaled.height << classifierPyrCount);
       roi << faceBounds;
     }
-    auto xmit = roi.scale<prec>(7, 5.0/12);
-
-    cout << xmit << endl;
+    auto xmit = roi.scale<prec>(kZoom, kEyes);
+    
+    //cout << xmit << endl;
     
     try {
       cv::Point2f src[]{
@@ -521,22 +465,30 @@ main()
       throw e;
     }
 
-#if 0
-    // Now that the output has been drawn, we can draw on the operator
-    // window.
-    if (faces.size() > 0) {
-      dbgRect(frame, faceBounds, cv::Scalar(0, 255, 0));
+    if (operator_stream.queryIfComplete()) {
+      if (!operator_display_gpu.empty())
+        cv::imshow(opwin, operator_display_gpu);
+      for (auto&& face : faces_cpu) {
+        cv::Rect scaledFace(face.x << classifierPyrCount,
+                            face.y << classifierPyrCount,
+                            face.width << classifierPyrCount,
+                            face.height << classifierPyrCount);
+        dbgRect(operator_display, scaledFace, cv::Scalar(0, 255, 0));
+      }
+      dbgRect(operator_display, static_cast<cv::Rect>(roi),
+              cv::Scalar(255, 0, 0));
+      dbgRect(operator_display, xmit, cv::Scalar(38, 38, 238));
+      operator_display_gpu.upload(operator_display, operator_stream);
     }
-    dbgRect(frame, static_cast<cv::Rect>(roi), cv::Scalar(255, 0, 0));
-    dbgRect(frame, xmit, cv::Scalar(38, 38, 238));
-#endif
     
-    cv::imshow(opwin, operator_display);
     background.waitForCompletion();  // Wait for the affine transform
-    cv::imshow(outwin, output);
-    cv::cuda::cvtColor(output, output, cv::COLOR_BGRA2YUV_I420, 0, background);
     output.download(output_cpu, background);
-    background.waitForCompletion();  // Wait for the download
+    cv::imshow(outwin, output);
+    // cv::cuda::cvtColor only supports YUV at 4:4:4, and V4L2 doesn't
+    // have that as a planar format.
+    //cv::cuda::cvtColor(output, output, cv::COLOR_BGR2YUV, 0, background);
+    background.waitForCompletion();
+    cv::cvtColor(output_cpu, output_cpu, cv::COLOR_BGR2YUV_I420);
     auto written = write(out_fd, output_cpu.data,
                          kOutHeight * kOutWidth * 3 / 2);
     if (written < 0)
@@ -550,6 +502,7 @@ main()
     if (interval_duration.count() >= 1) {
       int fps = interval_frames / interval_duration.count();
       cout << "FPS: " << fps << endl;
+      cout << "ROI: " << static_cast<cv::Rect>(roi) << endl;
       interval_frames = 0;
       interval_start = now;
     }
