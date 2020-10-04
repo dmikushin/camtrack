@@ -263,8 +263,11 @@ int
 main()
 {
   cv::CascadeClassifier face_cascade;
-  if (!face_cascade.load("haarcascade_frontalface_default.xml"))
-    err(1, "haarcascade_frontalface_default.xml");
+  // This is taken from
+  // https://github.com/opencv/opencv/blob/master/data/haarcascades/haarcascade_frontalface_default.xml
+  // On Debian, it's in /usr/share/opencv4/haarcascades/
+  if (!face_cascade.load("haarcascade_cpu.xml"))
+    err(1, "haarcascade_cpu.xml");
 
   int out_fd = open("/dev/video0", O_RDWR);
   if (out_fd < 0)
