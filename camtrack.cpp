@@ -269,6 +269,8 @@ main()
   cv::cuda::setDevice(0);
   cv::cuda::printShortCudaDeviceInfo(0);
 
+  // This is taken from
+  // https://github.com/opencv/opencv/blob/master/data/haarcascades_cuda/haarcascade_frontalface_default.xml
   // alt2: just spins the GPU
   // alt_tree: doesn't recognize me
   // alt: doesn't see me often
