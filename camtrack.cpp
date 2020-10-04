@@ -19,25 +19,31 @@ using std::cerr;
 using std::endl;
 
 typedef float prec;
+constexpr int kOperScale = 1;
 constexpr int kOutWidth = 640;
 constexpr int kOutHeight = 480;
 constexpr prec kOutAspect = (prec)kOutWidth / kOutHeight;
-// I put a lot of primes in here to try to keep the zoom algorithms
-// from converging on small binary fractions; I figured that would
-// allow the image smoothing algorithms to blur out shifts.  Sadly, it
-// didn't work.
-constexpr prec kLPFSlewRate = 1.0/101;
-constexpr prec kBoundedMaxSlew = 43.0/41.0;
-constexpr prec kBoundedMaxSlewAccel = 1.0/13;
+// These rates are initialized in main.  They're more or less used as
+// constants, but there are knobs to adjust them.
+prec kLPFSlewRate;
+prec kBoundedMaxSlew;
+prec kBoundedMaxSlewAccel;
+prec kZoom;
+prec kEyes;
 
 inline void
 dbgRect(cv::Mat &img __attribute__((unused)),
-        cv::Rect rec __attribute__((unused)),
+        cv::Rect rect __attribute__((unused)),
         const cv::Scalar &color __attribute__((unused)),
         int thickness __attribute__((unused)) = 1,
         int lineType __attribute__((unused)) = cv::LINE_8,
         int shift __attribute__((unused)) = 0) {
-  cv::rectangle(img, rec, color, thickness, lineType, shift);
+  cv::rectangle(img,
+                cv::Rect(rect.x/kOperScale,
+                         rect.y/kOperScale,
+                         rect.width/kOperScale,
+                         rect.height/kOperScale),
+                color, thickness, lineType, shift);
 }
 
 // ABC
@@ -270,76 +276,24 @@ main()
     err(1, "VIDIOC_G_FMT");
   vid_format.fmt.pix.width = kOutWidth;
   vid_format.fmt.pix.height = kOutHeight;
-  // Discord likes YUV420 (aka I420); it doesn't like RGB.
+  // Chrome only supports:
+  // V4L2_PIX_FMT_YUV420, V4L2_PIX_FMT_Y16, V4L2_PIX_FMT_Z16, 
+  // V4L2_PIX_FMT_INVZ, V4L2_PIX_FMT_YUYV, V4L2_PIX_FMT_RGB24, 
+  // V4L2_PIX_FMT_MJPEG, V4L2_PIX_FMT_JPEG
+  // Discord doesn't work with RGB24, but does with YUV420.
   vid_format.fmt.pix.pixelformat = V4L2_PIX_FMT_YUV420;
   vid_format.fmt.pix.sizeimage = kOutHeight * kOutWidth * 3 / 2;
   vid_format.fmt.pix.field = V4L2_FIELD_NONE;
   if (ioctl(out_fd, VIDIOC_S_FMT, &vid_format) < 0)
     err(1, "VIDIOC_S_FMT");
-  
+
   cv::VideoCapture cam(2, cv::CAP_V4L2);
   if (!cam.isOpened())
     errx(1, "open camera 2");
-  //cam.set(cv::CAP_PROP_FOURCC, cv::VideoWriter::fourcc('M', 'J', 'P', 'G'));
-  //cam.set(cv::CAP_PROP_FOURCC, cv::VideoWriter::fourcc('Y', 'U', 'Y', 'V'));
+  cam.set(cv::CAP_PROP_FOURCC, cv::VideoWriter::fourcc('Y', 'U', 'Y', 'V'));
+  // At sizes higher than this, my FPS drops terribly.
   cam.set(cv::CAP_PROP_FRAME_WIDTH, 640);
   cam.set(cv::CAP_PROP_FRAME_HEIGHT, 480);
-#define DUMP_PROP(x)                            \
-  do {                                          \
-      auto propVal = cam.get(cv:: x);           \
-      if (propVal != -1)                        \
-        cout << #x << ": " << propVal << endl;  \
-  } while (0)
-  DUMP_PROP(CAP_PROP_POS_MSEC);
-  DUMP_PROP(CAP_PROP_POS_FRAMES);
-  DUMP_PROP(CAP_PROP_POS_AVI_RATIO);
-  DUMP_PROP(CAP_PROP_FRAME_WIDTH);
-  DUMP_PROP(CAP_PROP_FRAME_HEIGHT);
-  DUMP_PROP(CAP_PROP_FPS);
-  //DUMP_PROP(CAP_PROP_FOURCC);
-  DUMP_PROP(CAP_PROP_FRAME_COUNT);
-  DUMP_PROP(CAP_PROP_FORMAT);
-  DUMP_PROP(CAP_PROP_MODE);
-  DUMP_PROP(CAP_PROP_BRIGHTNESS);
-  DUMP_PROP(CAP_PROP_CONTRAST);
-  DUMP_PROP(CAP_PROP_SATURATION);
-  DUMP_PROP(CAP_PROP_HUE);
-  DUMP_PROP(CAP_PROP_GAIN);
-  DUMP_PROP(CAP_PROP_EXPOSURE);
-  DUMP_PROP(CAP_PROP_CONVERT_RGB);
-  DUMP_PROP(CAP_PROP_WHITE_BALANCE_BLUE_U);
-  DUMP_PROP(CAP_PROP_RECTIFICATION);
-  DUMP_PROP(CAP_PROP_MONOCHROME);
-  DUMP_PROP(CAP_PROP_SHARPNESS);
-  DUMP_PROP(CAP_PROP_AUTO_EXPOSURE);
-  DUMP_PROP(CAP_PROP_GAMMA);
-  DUMP_PROP(CAP_PROP_TEMPERATURE);
-  DUMP_PROP(CAP_PROP_TRIGGER);
-  DUMP_PROP(CAP_PROP_TRIGGER_DELAY);
-  DUMP_PROP(CAP_PROP_WHITE_BALANCE_RED_V);
-  DUMP_PROP(CAP_PROP_ZOOM);
-  DUMP_PROP(CAP_PROP_FOCUS);
-  DUMP_PROP(CAP_PROP_GUID);
-  DUMP_PROP(CAP_PROP_ISO_SPEED);
-  DUMP_PROP(CAP_PROP_BACKLIGHT);
-  DUMP_PROP(CAP_PROP_PAN);
-  DUMP_PROP(CAP_PROP_TILT);
-  DUMP_PROP(CAP_PROP_ROLL);
-  DUMP_PROP(CAP_PROP_IRIS);
-  DUMP_PROP(CAP_PROP_SETTINGS);
-  DUMP_PROP(CAP_PROP_BUFFERSIZE);
-  DUMP_PROP(CAP_PROP_AUTOFOCUS);
-  DUMP_PROP(CAP_PROP_SAR_NUM);
-  DUMP_PROP(CAP_PROP_SAR_DEN);
-  DUMP_PROP(CAP_PROP_BACKEND);
-  DUMP_PROP(CAP_PROP_CHANNEL);
-  DUMP_PROP(CAP_PROP_AUTO_WB);
-  DUMP_PROP(CAP_PROP_WB_TEMPERATURE);
-  DUMP_PROP(CAP_PROP_CODEC_PIXEL_FORMAT);
-  //DUMP_PROP(CAP_PROP_BITRATE);
-  //DUMP_PROP(CAP_PROP_ORIENTATION_META);
-  //DUMP_PROP(CAP_PROP_ORIENTATION_AUTO);
-  
   int camWidth = cam.get(cv::CAP_PROP_FRAME_WIDTH);
   int camHeight = cam.get(cv::CAP_PROP_FRAME_HEIGHT);
   cv::Size outSize(kOutWidth, kOutHeight);
@@ -352,36 +306,99 @@ main()
        << static_cast<char>((fourcc >> 16) & 0x7f)
        << static_cast<char>((fourcc >> 24) & 0x7f)
        << endl;
-  
+
   std::string opwin("CamTrack Operator");
-  std::string outwin("CamTrack Output");
   cv::namedWindow(opwin);
+  std::string outwin("CamTrack Output");
   cv::namedWindow(outwin);
+
+  int minimumSizeDivisor = 10;
+  int classifierPyrCount = 0;
+  cv::Size cascadeMinSize, cascadeMaxSize;
+  auto adjustCascadeSizes =
+      [camWidth, camHeight, &classifierPyrCount, face_cascade,
+       &minimumSizeDivisor, &cascadeMinSize, &cascadeMaxSize] {
+        int minSize = (camWidth >> classifierPyrCount) / minimumSizeDivisor;
+        cout << minSize << endl;
+        cascadeMinSize = cv::Size(minSize, minSize);
+        cascadeMaxSize = cv::Size(minSize*10, minSize*10);
+      };
+  adjustCascadeSizes();
+  std::function<void(void)> acsFunc = adjustCascadeSizes;
+  auto acsCallback = [](int, void* acsVoid) {
+                       auto acsFunc =
+                           static_cast<std::function<void(void)>*>(acsVoid);
+                       (*acsFunc)();
+                     };
+  cv::createTrackbar("Minimum size divisor", opwin, &minimumSizeDivisor, 64,
+                     acsCallback, &acsFunc);
+  cv::createTrackbar("Classifier prescale", opwin, &classifierPyrCount, 4,
+                     acsCallback, &acsFunc);
+  int initial = 20;
+  cv::createTrackbar("Slew LPF weight", opwin, &initial, 50,
+                     [](int pos, void*) {
+                       kLPFSlewRate = exp10(pos / -10.0);
+                     });
+  kLPFSlewRate = exp10(initial / -10.0);
+  initial = 10;
+  cv::createTrackbar("Slew vel", opwin, &initial, 20,
+                     [](int pos, void*) {
+                       kBoundedMaxSlew = pos / 10.0;
+                     });
+  kBoundedMaxSlew = initial / 10.0;
+  initial = 75;
+  cv::createTrackbar("Slew accel", opwin, &initial, 200,
+                     [](int pos, void*) {
+                       kBoundedMaxSlewAccel = pos / 1000.0;
+                     });
+  kBoundedMaxSlew = initial / 1000.0;
+  initial = 60;
+  cv::createTrackbar("Zoom", opwin, &initial, 150,
+                     [](int pos, void*) {
+                       kZoom = (pos+1) / 10.0;
+                     });
+  kZoom = initial / 10.0;
+  initial = 40;
+  cv::createTrackbar("Eyes", opwin, &initial, 120,
+                     [](int pos, void*) {
+                       kEyes = pos / 120.0;
+                     });
+  kEyes = initial / 120.0;
   
-  cv::Mat frame;
-  cv::Mat frame_gray;
-  cv::Mat output;
+  cv::Mat input;
+  cv::Mat input_gray;
+  cv::Mat operator_display;
   std::vector<cv::Rect> faces;
+  cv::Mat output;
 
   SmoothMovingRect<prec> roi(cv::Rect(0, 0, camWidth, camHeight), kOutAspect);
 
   int interval_frames = 0;
   auto interval_start = std::chrono::steady_clock::now();
-  
-  for (;;) {
-    cam >> frame;
 
-    cv::cvtColor(frame, frame_gray, cv::COLOR_BGR2GRAY);
-    cv::equalizeHist(frame_gray, frame_gray);
-    face_cascade.detectMultiScale(frame_gray, faces);
+  while (1) {
+    cam >> input;
+
+    cv::cvtColor(input, input_gray, cv::COLOR_BGR2GRAY);
+    for (int i = 0; i < classifierPyrCount; i++)
+      cv::pyrDown(input_gray, input_gray);
+    cv::equalizeHist(input_gray, input_gray);
+    cv::resize(input, operator_display, cv::Size(),
+               1.0/kOperScale, 1.0/kOperScale, cv::INTER_NEAREST);
+    face_cascade.detectMultiScale(input_gray, faces, 1.1, 3, 0,
+                                  cascadeMinSize, cascadeMaxSize);
 
     cv::Rect faceBounds;
     if (faces.size() > 0) {
-      faceBounds = rectBound(faces);
+      cv::Rect faceBoundsUnscaled = rectBound(faces);
+      faceBounds = cv::Rect(faceBoundsUnscaled.x << classifierPyrCount,
+                            faceBoundsUnscaled.y << classifierPyrCount,
+                            faceBoundsUnscaled.width << classifierPyrCount,
+                            faceBoundsUnscaled.height << classifierPyrCount);
       roi << faceBounds;
     }
-    auto xmit = roi.scale<prec>(7, 5.0/12);
-
+    auto xmit = roi.scale<prec>(kZoom, kEyes);
+    
     //cout << xmit << endl;
     
     try {
@@ -394,7 +411,7 @@ main()
                        {0, kOutHeight},
                        {kOutWidth, kOutHeight}};
       auto xfrm = cv::getAffineTransform(src, dst);
-      cv::warpAffine(frame, output, xfrm,
+      cv::warpAffine(input, output, xfrm,
                      cv::Size{kOutWidth, kOutHeight},
                      cv::INTER_LINEAR);
     } catch (cv::Exception &e) {
@@ -405,13 +422,18 @@ main()
 
     // Now that the output has been drawn, we can draw on the operator
     // window.
-    if (faces.size() > 0) {
-      dbgRect(frame, faceBounds, cv::Scalar(0, 255, 0));
+    for (auto&& face : faces) {
+      cv::Rect scaledFace(face.x << classifierPyrCount,
+                          face.y << classifierPyrCount,
+                          face.width << classifierPyrCount,
+                          face.height << classifierPyrCount);
+      dbgRect(operator_display, scaledFace, cv::Scalar(0, 255, 0));
     }
-    dbgRect(frame, static_cast<cv::Rect>(roi), cv::Scalar(255, 0, 0));
-    dbgRect(frame, xmit, cv::Scalar(38, 38, 238));
+    dbgRect(operator_display, static_cast<cv::Rect>(roi),
+            cv::Scalar(255, 0, 0));
+    dbgRect(operator_display, xmit, cv::Scalar(38, 38, 238));
 
-    cv::imshow(opwin, frame);
+    cv::imshow(opwin, operator_display);
     cv::imshow(outwin, output);
     cv::cvtColor(output, output, cv::COLOR_BGR2YUV_I420);
     auto written = write(out_fd, output.data, kOutHeight * kOutWidth * 3 / 2);
@@ -426,12 +448,15 @@ main()
     if (interval_duration.count() >= 1) {
       int fps = interval_frames / interval_duration.count();
       cout << "FPS: " << fps << endl;
+      cout << "ROI: " << static_cast<cv::Rect>(roi) << endl;
       interval_frames = 0;
       interval_start = now;
     }
   }
+
+  cout << "End of stream" << endl;
 }
 
 // Local Variables:
-// compile-command: "g++ -Werror -Wall -Wextra -O2 -g -I/usr/include/opencv4 camtrack.cpp -lopencv_videoio -lopencv_highgui -lopencv_imgproc -l opencv_objdetect -lopencv_core -o camtrack"
+// compile-command: "g++ -Werror -Wall -Wextra -Og -g -I/usr/include/opencv4 camtrack.cpp -lopencv_core -lopencv_highgui -lopencv_imgproc -lopencv_objdetect -lopencv_videoio -o camtrack"
 // End:
