@@ -71,7 +71,7 @@ class SmoothMoverLPF : public SmoothMoverABC<T> {
   void operator<<(T target) override {
     s_ = s_ * (1 - kLPFSlewRate) + target * kLPFSlewRate;
   }
-  
+
  private:
   T s_;
 };
@@ -88,7 +88,7 @@ class SmoothMoverBoundedAccel : public SmoothMoverABC<T> {
   SmoothMoverBoundedAccel& operator=(SmoothMoverBoundedAccel&&) = default;
   explicit operator T() const override { return s_; }
   void operator<<(T target) override;
-  
+
  private:
   T s_;
   T ds_;
@@ -128,7 +128,7 @@ class SmoothMoverCompose : public SmoothMoverABC<T> {
     r_ << target;
     s_ << static_cast<T>(r_);
   }
-  
+
  private:
   R r_;
   S s_;
@@ -164,7 +164,7 @@ class SmoothMovingRect {
     return scale<Q>(1, 0.5);
   }
   void operator<<(const cv::Rect_<T>&);
-  
+
  private:
   const cv::Rect_<T> bounds_;
   const T aspect_;
@@ -195,7 +195,7 @@ SmoothMovingRect<T>::scale(T factor, T verticalPositioning) const {
        << bounds_.x << "+"
        << bounds_.y;
 #endif
-  
+
   // Shrink it into bounds, while maintaining the aspect ratio.  We
   // always shrink from all edges, to maintain the center.
   if (x < 0) {
@@ -236,7 +236,7 @@ SmoothMovingRect<T>::scale(T factor, T verticalPositioning) const {
        << x << "+"
        << y << endl;
 #endif
-  
+
   return cv::Rect_<Q>(x, y, width, height);
 }
 
@@ -279,7 +279,7 @@ main()
   // The CPU and GPU defaults are listed here.
   face_cascade->setScaleFactor(1.1);                  // 1.1, 1.2
   face_cascade->setMinNeighbors(3);                   // 3, 4
-  
+
   int out_fd = open("/dev/video0", O_RDWR);
   if (out_fd < 0)
     err(1, "/dev/video0");
@@ -291,8 +291,8 @@ main()
   vid_format.fmt.pix.width = kOutWidth;
   vid_format.fmt.pix.height = kOutHeight;
   // Chrome only supports:
-  // V4L2_PIX_FMT_YUV420, V4L2_PIX_FMT_Y16, V4L2_PIX_FMT_Z16, 
-  // V4L2_PIX_FMT_INVZ, V4L2_PIX_FMT_YUYV, V4L2_PIX_FMT_RGB24, 
+  // V4L2_PIX_FMT_YUV420, V4L2_PIX_FMT_Y16, V4L2_PIX_FMT_Z16,
+  // V4L2_PIX_FMT_INVZ, V4L2_PIX_FMT_YUYV, V4L2_PIX_FMT_RGB24,
   // V4L2_PIX_FMT_MJPEG, V4L2_PIX_FMT_JPEG
   // Discord doesn't work with RGB24, but does with YUV420.
   vid_format.fmt.pix.pixelformat = V4L2_PIX_FMT_YUV420;
@@ -393,10 +393,10 @@ main()
                        kEyes = pos / 120.0;
                      });
   kEyes = initial / 120.0;
-  
+
   cv::cuda::Stream background;
   cv::cuda::Stream operator_stream;
-  
+
   cv::Mat input_cpu;
   cv::cuda::GpuMat input;
   cv::cuda::GpuMat input_gray;
@@ -440,9 +440,9 @@ main()
       roi << faceBounds;
     }
     auto xmit = roi.scale<prec>(kZoom, kEyes);
-    
+
     //cout << xmit << endl;
-    
+
     try {
       cv::Point2f src[]{
                        {xmit.x, xmit.y},
@@ -480,7 +480,7 @@ main()
       dbgRect(operator_display, xmit, cv::Scalar(38, 38, 238));
       operator_display_gpu.upload(operator_display, operator_stream);
     }
-    
+
     background.waitForCompletion();  // Wait for the affine transform
     output.download(output_cpu, background);
     cv::imshow(outwin, output);
@@ -493,7 +493,7 @@ main()
                          kOutHeight * kOutWidth * 3 / 2);
     if (written < 0)
       err(1, "write frame");
-    
+
     cv::waitKey(10);
 
     interval_frames++;
