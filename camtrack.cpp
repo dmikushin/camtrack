@@ -4,6 +4,7 @@
 #include <iostream>
 
 #include <sys/ioctl.h>
+#include <sys/mman.h>
 #include <linux/videodev2.h>
 #include <err.h>
 #include <fcntl.h>
@@ -16,8 +17,6 @@
 #include <opencv2/cudawarping.hpp>
 #include <opencv2/highgui.hpp>
 #include <opencv2/imgproc.hpp>
-#include <opencv2/objdetect.hpp>
-#include <opencv2/videoio.hpp>
 
 using std::cout;
 using std::cerr;
@@ -274,11 +273,12 @@ class RawV4L2CudaSource : public cv::cudacodec::RawVideoSource {
   int height() const { return height_; }
   
  private:
+  static constexpr int kNumBufs = 10;
   int fd_;
   struct v4l2_format vid_format_;
-  //cv::cuda::HostMem buf_(cv::cuda::HostMem::AllocType::WRITE_COMBINED);
-  std::vector<char> buf_;
   int width_ = 0, height_ = 0;
+  struct { unsigned char *data; size_t length; } bufs_[kNumBufs];
+  std::array<int, 4> last_bufs_{-1, -1, -1, -1};
 };
 
 RawV4L2CudaSource::RawV4L2CudaSource(const char* filename) {
@@ -292,7 +292,7 @@ RawV4L2CudaSource::RawV4L2CudaSource(const char* filename) {
     err(1, "%s: initial VIDIOC_G_FMT", filename);
   vid_format_.fmt.pix.width = 1920;
   vid_format_.fmt.pix.height = 1080;
-  vid_format_.fmt.pix.pixelformat = V4L2_PIX_FMT_JPEG;
+  vid_format_.fmt.pix.pixelformat = V4L2_PIX_FMT_MJPEG;
   vid_format_.fmt.pix.field = V4L2_FIELD_NONE;
   vid_format_.fmt.pix.bytesperline = 0;
   vid_format_.fmt.pix.sizeimage = 0;
@@ -302,14 +302,65 @@ RawV4L2CudaSource::RawV4L2CudaSource(const char* filename) {
   // Record what we got
   if (ioctl(fd_, VIDIOC_G_FMT, &vid_format_) < 0)
     err(1, "%s: followup VIDIOC_G_FMT", filename);
-
-  //buf_.create(1, vid_format_.fmt.pix.sizeimage, CV_8U);
-  buf_.resize(vid_format_.fmt.pix.sizeimage);
   width_ = vid_format_.fmt.pix.width;
   height_ = vid_format_.fmt.pix.height;  
+
+  struct v4l2_capability caps;
+  memset(&caps, 0, sizeof(caps));
+  if (ioctl(fd_, VIDIOC_QUERYCAP, &caps) < 0)
+    err(1, "%s: VIDIOC_QUERYCAP", filename);
+  if ((caps.capabilities & (V4L2_CAP_DEVICE_CAPS | V4L2_CAP_STREAMING))
+      != (V4L2_CAP_DEVICE_CAPS | V4L2_CAP_STREAMING))
+    err(1, "%s: Doesn't support mmap", filename);
+
+  struct v4l2_requestbuffers reqbuf;
+  memset(&reqbuf, 0, sizeof(reqbuf));
+  reqbuf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+  reqbuf.memory = V4L2_MEMORY_MMAP;
+  reqbuf.count = kNumBufs;
+  if (ioctl(fd_, VIDIOC_REQBUFS, &reqbuf) < 0)
+    err(1, "%s: VIDIOC_REQBUFS", filename);
+  assert(reqbuf.count == kNumBufs);
+  for (int i = 0; i < kNumBufs; i++) {
+    struct v4l2_buffer buf;
+    memset(&buf, 0, sizeof(buf));
+    buf.index = i;
+    buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    buf.memory = V4L2_MEMORY_MMAP;
+    if (ioctl(fd_, VIDIOC_QUERYBUF, &buf) < 0)
+      err(1, "%s: VIDIOC_QUERYBUF(%i)", filename, i);
+    bufs_[i].length = buf.length;
+    bufs_[i].data = static_cast<unsigned char*>(
+        mmap(NULL, buf.length,
+             PROT_READ | PROT_WRITE, /* recommended by l4v2? */
+             MAP_SHARED,             /* recommended? */
+             fd_, buf.m.offset));
+    if (bufs_[i].data == MAP_FAILED)
+      err(1, "%s: mmap(%i)", filename, i);
+    if (ioctl(fd_, VIDIOC_QBUF, &buf) < 0)
+      err(1, "%s: VIDIOC_QBUF(%i)", filename, i);
+  }
+
+  int one = 1;
+  if (ioctl(fd_, VIDIOC_STREAMON, &one) < 0)
+    err(1, "%s: VIDIOC_STREAMON", filename);
 }
-  
+
 RawV4L2CudaSource::~RawV4L2CudaSource() {
+  for (int i = 0; i < kNumBufs; i++) {
+    int rv = munmap(bufs_[i].data, bufs_[i].length);
+    if (rv < 0)
+      err(1, "munmap(%i)", i);
+  }
+
+  struct v4l2_requestbuffers reqbuf;
+  memset(&reqbuf, 0, sizeof(reqbuf));
+  reqbuf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+  reqbuf.memory = V4L2_MEMORY_MMAP;
+  reqbuf.count = 0;
+  if (ioctl(fd_, VIDIOC_REQBUFS, &reqbuf) < 0)
+    err(1, "VIDIOC_REQBUFS(0) (during destructor)");
+
   if (close(fd_) < 0)
     err(1, "close camera");
 }
@@ -318,7 +369,7 @@ cv::cudacodec::FormatInfo
 RawV4L2CudaSource::format() const {
   cv::cudacodec::FormatInfo rv;
   memset(&rv, 0, sizeof(rv));
-  assert(vid_format_.fmt.pix.pixelformat == V4L2_PIX_FMT_JPEG);
+  assert(vid_format_.fmt.pix.pixelformat == V4L2_PIX_FMT_MJPEG);
   // The only format that the decoder supports is 8-bit YUV420.
   // (Actually, it uses NV12 internally.)  FIXME Verify this (cf
   // V4L2_JPEG_CHROMA_SUBSAMPLING_420 etc)
@@ -331,12 +382,44 @@ RawV4L2CudaSource::format() const {
   
 bool
 RawV4L2CudaSource::getNextPacket(unsigned char **data, size_t *size) {
-  *data = static_cast<unsigned char*>(static_cast<void*>(buf_.data()));
-  auto read_result = read(fd_, *data, vid_format_.fmt.pix.sizeimage);
-  if (read_result < 0)
-    err(1, "read frame");
-  *size = read_result;
-  return (read_result != 0);
+  int last_buf = last_bufs_[0];
+  for (unsigned int i = 1; i < last_bufs_.size(); i++) {
+    last_bufs_[i-1] = last_bufs_[i];
+  }
+      
+  if (last_buf != -1) {
+    struct v4l2_buffer buf;
+    memset(&buf, 0, sizeof(buf));
+    buf.index = last_buf;
+    buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    buf.memory = V4L2_MEMORY_MMAP;
+    if (ioctl(fd_, VIDIOC_QBUF, &buf) < 0)
+      err(1, "VIDIOC_QBUF(%i)", last_buf);
+    cout << "queued " << last_buf << endl;
+  }
+
+  struct v4l2_buffer buf;
+  memset(&buf, 0, sizeof(buf));
+  buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+  buf.memory = V4L2_MEMORY_MMAP;
+  if (ioctl(fd_, VIDIOC_DQBUF, &buf) < 0)
+    err(1, "VIDIOC_DQBUF");
+  if (buf.flags & V4L2_BUF_FLAG_ERROR)
+    errx(1, "VIDIOC_DQBUF returned a non-specific critical error");
+  last_bufs_.back() = buf.index;
+  *data = bufs_[buf.index].data;
+  *size = buf.bytesused;
+  cout << "dequeued " << buf.index << endl;
+
+#if 0
+  int dfd = open("foo.jpg", O_WRONLY | O_TRUNC | O_CREAT, 0666);
+  if (dfd < 0)
+    err(1, "foo.jpg");
+  write(dfd, *data, *size);
+  close(dfd);
+#endif
+  
+  return !(buf.flags & V4L2_BUF_FLAG_LAST);
 }
 
 int
@@ -370,7 +453,7 @@ main()
   if (ioctl(out_fd, VIDIOC_S_FMT, &vid_format) < 0)
     err(1, "VIDIOC_S_FMT");
 
-  auto cam_source = cv::makePtr<RawV4L2CudaSource>("/dev/video1");
+  auto cam_source = cv::makePtr<RawV4L2CudaSource>("/dev/video2");
   auto cam = cv::cudacodec::createVideoReader(cam_source);
   
   std::string opwin("CamTrack Operator");
@@ -409,7 +492,7 @@ main()
     operator_stream.waitForCompletion();
     cv::Rect faceBounds;
     if (faces_cpu.size() > 0) {
-      faceBounds = rectBound(faces);
+      faceBounds = rectBound(faces_cpu);
       roi << faceBounds;
     }
     auto xmit = roi.scale<prec>(7, 5.0/12);
@@ -459,7 +542,7 @@ main()
     if (written < 0)
       err(1, "write frame");
     
-    cv::waitKey(1);
+    cv::waitKey(10);
 
     interval_frames++;
     auto now = std::chrono::steady_clock::now();
@@ -471,8 +554,10 @@ main()
       interval_start = now;
     }
   }
+
+  cout << "End of stream" << endl;
 }
 
 // Local Variables:
-// compile-command: "g++ -Werror -Wall -Wextra -O2 -g -I/usr/include/opencv4 camtrack.cpp -lopencv_videoio -lopencv_highgui -lopencv_imgproc -l opencv_objdetect -lopencv_core -o camtrack"
+// compile-command: "g++ -Werror -Wall -Wextra -Og -g -I/usr/include/opencv4 camtrack.cpp -lopencv_core -lopencv_cudacodec -lopencv_cudaimgproc -lopencv_cudaobjdetect -lopencv_cudawarping -lopencv_highgui -lopencv_imgproc -o camtrack"
 // End:
