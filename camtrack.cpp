@@ -67,7 +67,7 @@ class SmoothMoverLPF : public SmoothMoverABC<T> {
   void operator<<(T target) override {
     s_ = s_ * (1 - kLPFSlewRate) + target * kLPFSlewRate;
   }
-  
+
  private:
   T s_;
 };
@@ -84,7 +84,7 @@ class SmoothMoverBoundedAccel : public SmoothMoverABC<T> {
   SmoothMoverBoundedAccel& operator=(SmoothMoverBoundedAccel&&) = default;
   explicit operator T() const override { return s_; }
   void operator<<(T target) override;
-  
+
  private:
   T s_;
   T ds_;
@@ -124,7 +124,7 @@ class SmoothMoverCompose : public SmoothMoverABC<T> {
     r_ << target;
     s_ << static_cast<T>(r_);
   }
-  
+
  private:
   R r_;
   S s_;
@@ -160,7 +160,7 @@ class SmoothMovingRect {
     return scale<Q>(1, 0.5);
   }
   void operator<<(const cv::Rect_<T>&);
-  
+
  private:
   const cv::Rect_<T> bounds_;
   const T aspect_;
@@ -191,7 +191,7 @@ SmoothMovingRect<T>::scale(T factor, T verticalPositioning) const {
        << bounds_.x << "+"
        << bounds_.y;
 #endif
-  
+
   // Shrink it into bounds, while maintaining the aspect ratio.  We
   // always shrink from all edges, to maintain the center.
   if (x < 0) {
@@ -232,7 +232,7 @@ SmoothMovingRect<T>::scale(T factor, T verticalPositioning) const {
        << x << "+"
        << y << endl;
 #endif
-  
+
   return cv::Rect_<Q>(x, y, width, height);
 }
 
@@ -277,8 +277,8 @@ main()
   vid_format.fmt.pix.width = kOutWidth;
   vid_format.fmt.pix.height = kOutHeight;
   // Chrome only supports:
-  // V4L2_PIX_FMT_YUV420, V4L2_PIX_FMT_Y16, V4L2_PIX_FMT_Z16, 
-  // V4L2_PIX_FMT_INVZ, V4L2_PIX_FMT_YUYV, V4L2_PIX_FMT_RGB24, 
+  // V4L2_PIX_FMT_YUV420, V4L2_PIX_FMT_Y16, V4L2_PIX_FMT_Z16,
+  // V4L2_PIX_FMT_INVZ, V4L2_PIX_FMT_YUYV, V4L2_PIX_FMT_RGB24,
   // V4L2_PIX_FMT_MJPEG, V4L2_PIX_FMT_JPEG
   // Discord doesn't work with RGB24, but does with YUV420.
   vid_format.fmt.pix.pixelformat = V4L2_PIX_FMT_YUV420;
@@ -364,7 +364,7 @@ main()
                        kEyes = pos / 120.0;
                      });
   kEyes = initial / 120.0;
-  
+
   cv::Mat input;
   cv::Mat input_gray;
   cv::Mat operator_display;
@@ -398,9 +398,9 @@ main()
       roi << faceBounds;
     }
     auto xmit = roi.scale<prec>(kZoom, kEyes);
-    
+
     //cout << xmit << endl;
-    
+
     try {
       cv::Point2f src[]{
                        {xmit.x, xmit.y},
@@ -439,7 +439,7 @@ main()
     auto written = write(out_fd, output.data, kOutHeight * kOutWidth * 3 / 2);
     if (written < 0)
       err(1, "write frame");
-    
+
     cv::waitKey(1);
 
     interval_frames++;
