@@ -4,7 +4,6 @@
 #include <iostream>
 
 #include <sys/ioctl.h>
-#include <sys/mman.h>
 #include <linux/videodev2.h>
 #include <err.h>
 #include <fcntl.h>
