@@ -1,1 +1,3 @@
 haarcascade_*.xml
+camtrack
+opencv-gpu
